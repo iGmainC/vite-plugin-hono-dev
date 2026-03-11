@@ -1,6 +1,10 @@
 # @igmainc/vite-plugin-hono-dev
 
-[English](./README.md) | 简体中文
+[![CI](https://github.com/iGmainC/vite-plugin-hono-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/iGmainC/vite-plugin-hono-dev/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/%40igmainc%2Fvite-plugin-hono-dev)](https://www.npmjs.com/package/@igmainc/vite-plugin-hono-dev)
+[![license](https://img.shields.io/npm/l/%40igmainc%2Fvite-plugin-hono-dev)](../LICENSE)
+
+[English](../README.md) | 简体中文
 
 一个用于 Vite 开发阶段的插件：在请求命中 Hono 路由时，动态反向代理到独立 Hono 后端。
 

@@ -1,6 +1,10 @@
 # @igmainc/vite-plugin-hono-dev
 
-English | [简体中文](./README_zh.md)
+[![CI](https://github.com/iGmainC/vite-plugin-hono-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/iGmainC/vite-plugin-hono-dev/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/%40igmainc%2Fvite-plugin-hono-dev)](https://www.npmjs.com/package/@igmainc/vite-plugin-hono-dev)
+[![license](https://img.shields.io/npm/l/%40igmainc%2Fvite-plugin-hono-dev)](./LICENSE)
+
+English | [简体中文](./docs/README.zh-CN.md)
 
 A Vite plugin that dynamically reverse-proxies matched requests to a standalone Hono backend during development.
 
