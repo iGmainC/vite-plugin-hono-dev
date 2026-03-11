@@ -119,6 +119,14 @@ Visit:
 - `http://localhost:5173/ssr` (HTML from Hono backend)
 - `http://localhost:5173/api/user/42` (JSON from Hono backend)
 
+## Example Project
+
+This plugin is also used in [`node-fullstack-template`](https://github.com/iGmainC/node-fullstack-template), a full-stack starter built with `Bun + Vite + React + Hono + tRPC + Prisma`.
+
+In that template, `bun run dev` starts the frontend Vite dev server while this plugin loads `apps/backend/server.ts`, starts the local Hono backend on `http://localhost:8787`, proxies requests based on registered Hono routes, and hot-reloads backend changes without a manual restart.
+
+If you want a reference integration beyond the small examples in this repository, that template shows how to use this plugin in a real workspace with separate frontend/backend apps and shared packages.
+
 ## Limitations
 
 - Dev-only plugin, not used in production build.

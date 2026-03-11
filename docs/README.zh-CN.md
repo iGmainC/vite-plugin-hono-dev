@@ -119,6 +119,14 @@ bun run dev
 - `http://localhost:5173/ssr`（由 Hono 后端返回 HTML）
 - `http://localhost:5173/api/user/42`（由 Hono 后端返回 JSON）
 
+## 示例项目
+
+这个插件也已经实际用在 [`node-fullstack-template`](https://github.com/iGmainC/node-fullstack-template) 中。这个仓库是一个基于 `Bun + Vite + React + Hono + tRPC + Prisma` 的全栈脚手架模板。
+
+在这个模板里，执行 `bun run dev` 时，前端由 Vite dev server 提供开发能力，而本插件会负责加载 `apps/backend/server.ts`、启动本地 Hono 后端（默认 `http://localhost:8787`）、按已注册路由代理请求，并在后端代码变更时进行热重载，无需手动重启服务。
+
+如果你想看比本仓库内置示例更接近真实项目的集成方式，这个模板展示了它在前后端分离目录、共享 packages 的 workspace 结构中的实际用法。
+
 ## 限制与注意事项
 
 - 仅用于开发期，不参与生产构建。
