@@ -1,0 +1,53 @@
+{
+  "name": "@igmainc/vite-plugin-hono-dev",
+  "version": "0.1.0",
+  "description": "A Vite plugin that dynamically proxies matched requests to a standalone Hono backend in dev",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "vite",
+    "hono",
+    "proxy",
+    "dynamic-proxy",
+    "dev-server"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "build:tsup": "tsup",
+    "build:bun": "bun build ./src/index.ts --format esm --outdir ./dist --target node --external vite --external hono --external @hono/node-server",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsup --watch",
+    "test:smoke": "node ./scripts/smoke-test.mjs",
+    "prepublishOnly": "bun run typecheck && bun run build && bun run test:smoke"
+  },
+  "peerDependencies": {
+    "@hono/node-server": ">=1",
+    "hono": ">=4",
+    "vite": ">=6"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^1.19.9",
+    "@types/node": "^24.10.13",
+    "hono": "^4.12.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}
