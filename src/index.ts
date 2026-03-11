@@ -1,22 +1,13 @@
+import type { IncomingMessage, RequestOptions, ServerResponse } from "node:http";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as path from "node:path";
-import type {
-  IncomingMessage,
-  RequestOptions,
-  ServerResponse,
-} from "node:http";
 import { createAdaptorServer, type ServerType } from "@hono/node-server";
 import { METHOD_NAME_ALL, type Result } from "hono/router";
 import type { RouterRoute } from "hono/types";
+import { isMiddleware } from "hono/utils/handler";
 import { getPath } from "hono/utils/url";
-import {
-  normalizePath,
-  type HotUpdateOptions,
-  type Plugin,
-  type ResolvedConfig,
-  type ViteDevServer,
-} from "vite";
+import { type HotUpdateOptions, normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from "vite";
 
 /**
  * 插件入参：
@@ -27,6 +18,8 @@ export interface HonoDevProxyPluginOptions {
   entry: string;
   port?: number;
   host?: string;
+  debug?: boolean;
+  stripTrailingSlash?: boolean;
 }
 
 /**
@@ -55,8 +48,7 @@ const DEFAULT_PORT = 8787;
 type MiddlewareNext = (error?: unknown) => void;
 
 /** 判断值是否为非 null 对象 */
-const isObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null;
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
 /**
  * 运行时校验是否为“可用的 Hono app”。
@@ -67,8 +59,7 @@ const isHonoLikeApp = (value: unknown): value is HonoLikeApp => {
   if (!("fetch" in value) || typeof value.fetch !== "function") return false;
   if (!("routes" in value) || !Array.isArray(value.routes)) return false;
   if (!("router" in value) || !isObject(value.router)) return false;
-  if (!("match" in value.router) || typeof value.router.match !== "function")
-    return false;
+  if (!("match" in value.router) || typeof value.router.match !== "function") return false;
   return true;
 };
 
@@ -85,9 +76,7 @@ const extractHonoApp = (moduleExports: unknown, entry: string): HonoLikeApp => {
 
   const maybeApp = moduleExports.default ?? moduleExports.app;
   if (!isHonoLikeApp(maybeApp)) {
-    throw new Error(
-      `[hono-dev-proxy] "${entry}" must export a Hono app via default export or named export "app".`,
-    );
+    throw new Error(`[hono-dev-proxy] "${entry}" must export a Hono app via default export or named export "app".`);
   }
   return maybeApp;
 };
@@ -98,8 +87,7 @@ const extractHonoApp = (moduleExports: unknown, entry: string): HonoLikeApp => {
  * - 否则退回 req.url
  */
 const getOriginalUrl = (req: IncomingMessage): string => {
-  const originalUrl = (req as IncomingMessage & { originalUrl?: string })
-    .originalUrl;
+  const originalUrl = (req as IncomingMessage & { originalUrl?: string }).originalUrl;
   return originalUrl ?? req.url ?? "/";
 };
 
@@ -116,18 +104,41 @@ const getRequestPathname = (req: IncomingMessage): string => {
   return getPath(new Request(requestUrl));
 };
 
+const stripTrailingSlash = (pathName: string): string =>
+  pathName.length > 1 && pathName.endsWith("/") ? pathName.slice(0, -1) : pathName;
+
+const getProxyRequestPath = (req: IncomingMessage, enableStripTrailingSlash: boolean): string => {
+  const rawUrl = getOriginalUrl(req);
+  const requestUrl =
+    rawUrl.startsWith("http://") || rawUrl.startsWith("https://")
+      ? rawUrl
+      : `http://${req.headers.host ?? "localhost"}${rawUrl}`;
+  const url = new URL(requestUrl);
+
+  if (enableStripTrailingSlash) {
+    url.pathname = stripTrailingSlash(url.pathname);
+  }
+  return `${url.pathname}${url.search}`;
+};
+
 const getRouteKey = (route: Pick<RouterRoute, "method" | "path">): string =>
   `${route.method.toUpperCase()} ${route.path}`;
+
+const isProxyableRoute = (route: RouterRoute): boolean =>
+  !isMiddleware(route.handler as (...args: unknown[]) => unknown);
+
+const collectMatchedRouteKeys = (matchedResult: MatchedRouteResult, appRoutes: ReadonlySet<string>): string[] => {
+  const [matchedRoutes] = matchedResult;
+  return matchedRoutes
+    .map(([matchedRouteEntry]) => getRouteKey(matchedRouteEntry[1]))
+    .filter((routeKey) => appRoutes.has(routeKey));
+};
 
 /**
  * 判断当前 router.match 的结果中，是否包含“真正来自 app.routes 的命中路由”。
  * 之所以额外和 app.routes 交叉校验，是为了严格满足“基于获取到的全部路由做匹配检查”的要求。
  */
-const hasRouteMatch = (
-  matchedResult: MatchedRouteResult,
-  appRoutes: ReadonlySet<string>,
-  method: string,
-): boolean => {
+const hasRouteMatch = (matchedResult: MatchedRouteResult, appRoutes: ReadonlySet<string>, method: string): boolean => {
   const [matchedRoutes] = matchedResult;
   if (matchedRoutes.length === 0) return false;
 
@@ -166,46 +177,44 @@ const shouldProxyRequest = (
  * - 处理代理错误与请求中断
  */
 const proxyToBackend = (
-  req: IncomingMessage,
   res: ServerResponse,
   targetOrigin: string,
+  requestPath: string,
+  requestMethod: string | undefined,
+  requestHeaders: IncomingMessage["headers"],
+  requestStream: IncomingMessage,
   onError: (error: Error) => void,
 ): void => {
-  const targetUrl = new URL(getOriginalUrl(req), targetOrigin);
+  const targetUrl = new URL(requestPath, targetOrigin);
   const isSecure = targetUrl.protocol === "https:";
 
   const requestOptions: RequestOptions = {
     protocol: targetUrl.protocol,
     hostname: targetUrl.hostname,
     port: targetUrl.port,
-    method: req.method,
+    method: requestMethod,
     path: `${targetUrl.pathname}${targetUrl.search}`,
     headers: {
-      ...req.headers,
+      ...requestHeaders,
       host: targetUrl.host,
       origin: targetOrigin,
     },
   };
-  const proxyRequest = (isSecure ? https : http).request(
-    requestOptions,
-    (proxyResponse) => {
-      // 将后端状态码与状态文本透传给 Vite 当前请求
-      res.statusCode = proxyResponse.statusCode ?? 502;
-      if (proxyResponse.statusMessage) {
-        res.statusMessage = proxyResponse.statusMessage;
+  const proxyRequest = (isSecure ? https : http).request(requestOptions, (proxyResponse) => {
+    // 将后端状态码与状态文本透传给 Vite 当前请求
+    res.statusCode = proxyResponse.statusCode ?? 502;
+    if (proxyResponse.statusMessage) {
+      res.statusMessage = proxyResponse.statusMessage;
+    }
+    // 将后端响应头完整转发到客户端
+    for (const [headerName, headerValue] of Object.entries(proxyResponse.headers)) {
+      if (headerValue !== undefined) {
+        res.setHeader(headerName, headerValue);
       }
-      // 将后端响应头完整转发到客户端
-      for (const [headerName, headerValue] of Object.entries(
-        proxyResponse.headers,
-      )) {
-        if (headerValue !== undefined) {
-          res.setHeader(headerName, headerValue);
-        }
-      }
-      // 响应体流式透传，避免大响应体造成内存堆积
-      proxyResponse.pipe(res);
-    },
-  );
+    }
+    // 响应体流式透传，避免大响应体造成内存堆积
+    proxyResponse.pipe(res);
+  });
 
   proxyRequest.on("error", (error) => {
     onError(error);
@@ -217,29 +226,25 @@ const proxyToBackend = (
     }
   });
 
-  req.on("aborted", () => {
+  requestStream.on("aborted", () => {
     proxyRequest.destroy();
   });
 
-  const requestMethod = req.method?.toUpperCase() ?? "GET";
+  const normalizedMethod = requestMethod?.toUpperCase() ?? "GET";
   // 无 body 的请求直接结束；其余请求将 body 管道传给后端
-  if (
-    requestMethod === "GET" ||
-    requestMethod === "HEAD" ||
-    req.readableEnded
-  ) {
+  if (normalizedMethod === "GET" || normalizedMethod === "HEAD" || requestStream.readableEnded) {
     proxyRequest.end();
     return;
   }
 
-  req.pipe(proxyRequest);
+  requestStream.pipe(proxyRequest);
 };
 
-export default function honoDevProxyPlugin(
-  options: HonoDevProxyPluginOptions,
-): Plugin {
+export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): Plugin {
   const backendHost = options.host ?? DEFAULT_HOST;
   const backendPort = options.port ?? DEFAULT_PORT;
+  const debugEnabled = options.debug ?? false;
+  const stripTrailingSlashEnabled = options.stripTrailingSlash ?? true;
 
   // 在 configResolved 后会转换为绝对路径
   let entryPath = options.entry;
@@ -259,10 +264,7 @@ export default function honoDevProxyPlugin(
   /** 判断改动文件是否属于后端入口目录 */
   const isBackendRelatedFile = (filePath: string): boolean => {
     const normalizedFilePath = normalizePath(filePath);
-    return (
-      normalizedFilePath === normalizedEntryPath ||
-      normalizedFilePath.startsWith(backendBaseDirPrefix)
-    );
+    return normalizedFilePath === normalizedEntryPath || normalizedFilePath.startsWith(backendBaseDirPrefix);
   };
 
   /**
@@ -272,39 +274,40 @@ export default function honoDevProxyPlugin(
    * 后端 Node Server 的 fetch 是“委托函数”，读取最新 loadedApp，
    * 所以后端逻辑会随这里的更新即时生效。
    */
-  const loadBackendApp = async (
-    server: ViteDevServer,
-    reason: string,
-    failOnError: boolean,
-  ): Promise<boolean> => {
+  const loadBackendApp = async (server: ViteDevServer, reason: string, failOnError: boolean): Promise<boolean> => {
     try {
       const moduleExports = await server.ssrLoadModule(entryPath);
       const nextApp = extractHonoApp(moduleExports, options.entry);
       loadedApp = nextApp;
-      appRoutes = new Set(nextApp.routes.map(getRouteKey));
+      const proxyableRoutes = nextApp.routes.filter(isProxyableRoute);
+      appRoutes = new Set(proxyableRoutes.map(getRouteKey));
 
-      const routeSummary = nextApp.routes
-        .map((route) => `${route.method} ${route.path}`)
-        .join(", ");
+      const routeSummary = nextApp.routes.map((route) => `${route.method} ${route.path}`).join(", ");
+      const proxyableRouteSummary = proxyableRoutes.map((route) => `${route.method} ${route.path}`).join(", ");
+      if (debugEnabled) {
+        const routeList = nextApp.routes.map((route) => ({
+          method: route.method,
+          path: route.path,
+          proxyable: isProxyableRoute(route),
+        }));
+        server.config.logger.info(`[hono-dev-proxy][debug] app.routes:\n${JSON.stringify(routeList, null, 2)}`);
+      }
       if (reason === "initial") {
         server.config.logger.info(
-          `[hono-dev-proxy] loaded ${nextApp.routes.length} route(s): ${routeSummary || "none"}`,
+          `[hono-dev-proxy] loaded ${nextApp.routes.length} route(s), proxyable ${proxyableRoutes.length} route(s): ` +
+            `all=${routeSummary || "none"}; proxyable=${proxyableRouteSummary || "none"}`,
         );
       } else {
         server.config.logger.info(
-          `[hono-dev-proxy] backend reloaded (${reason}), ${nextApp.routes.length} route(s): ${
-            routeSummary || "none"
-          }`,
+          `[hono-dev-proxy] backend reloaded (${reason}), ${nextApp.routes.length} route(s), proxyable ${proxyableRoutes.length} route(s): ` +
+            `all=${routeSummary || "none"}; proxyable=${proxyableRouteSummary || "none"}`,
         );
       }
       return true;
     } catch (error) {
-      const normalizedError =
-        error instanceof Error ? error : new Error(String(error));
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
       server.ssrFixStacktrace(normalizedError);
-      server.config.logger.error(
-        `[hono-dev-proxy] failed to load backend app (${reason}): ${normalizedError.message}`,
-      );
+      server.config.logger.error(`[hono-dev-proxy] failed to load backend app (${reason}): ${normalizedError.message}`);
       if (failOnError) {
         throw normalizedError;
       }
@@ -313,20 +316,14 @@ export default function honoDevProxyPlugin(
   };
 
   /** 串行执行后端重载任务 */
-  const enqueueBackendReload = (
-    server: ViteDevServer,
-    reason: string,
-  ): void => {
+  const enqueueBackendReload = (server: ViteDevServer, reason: string): void => {
     reloadQueue = reloadQueue
       .then(async () => {
         await loadBackendApp(server, reason, false);
       })
       .catch((error) => {
-        const normalizedError =
-          error instanceof Error ? error : new Error(String(error));
-        server.config.logger.error(
-          `[hono-dev-proxy] backend reload queue error: ${normalizedError.message}`,
-        );
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        server.config.logger.error(`[hono-dev-proxy] backend reload queue error: ${normalizedError.message}`);
       });
   };
 
@@ -342,9 +339,7 @@ export default function honoDevProxyPlugin(
       entryPath = path.resolve(config.root, options.entry);
       normalizedEntryPath = normalizePath(entryPath);
       backendBaseDir = normalizePath(path.dirname(entryPath));
-      backendBaseDirPrefix = backendBaseDir.endsWith("/")
-        ? backendBaseDir
-        : `${backendBaseDir}/`;
+      backendBaseDirPrefix = backendBaseDir.endsWith("/") ? backendBaseDir : `${backendBaseDir}/`;
       backendTarget = `http://${backendHost}:${backendPort}`;
     },
     hotUpdate(options: HotUpdateOptions) {
@@ -355,10 +350,7 @@ export default function honoDevProxyPlugin(
       if (eventKey !== lastReloadEventKey) {
         lastReloadEventKey = eventKey;
         const reasonType = options.type === "delete" ? "unlink" : options.type;
-        enqueueBackendReload(
-          options.server,
-          `${reasonType}: ${toChangedPath(options.server, options.file)}`,
-        );
+        enqueueBackendReload(options.server, `${reasonType}: ${toChangedPath(options.server, options.file)}`);
       }
 
       // 后端文件改动由本插件处理，阻止 Vite 默认 page reload / hmr 广播
@@ -381,56 +373,70 @@ export default function honoDevProxyPlugin(
         port: backendPort,
       });
 
-      server.config.logger.info(
-        `[hono-dev-proxy] starting backend on http://${backendHost}:${backendPort}`,
-      );
+      server.config.logger.info(`[hono-dev-proxy] starting backend on http://${backendHost}:${backendPort}`);
 
       backendServer.once("listening", () => {
         const address = backendServer?.address();
         if (address && typeof address === "object") {
-          server.config.logger.info(
-            `[hono-dev-proxy] backend ready on http://${address.address}:${address.port}`,
-          );
+          server.config.logger.info(`[hono-dev-proxy] backend ready on http://${address.address}:${address.port}`);
           return;
         }
-        server.config.logger.info(
-          `[hono-dev-proxy] backend ready on http://${backendHost}:${backendPort}`,
-        );
+        server.config.logger.info(`[hono-dev-proxy] backend ready on http://${backendHost}:${backendPort}`);
       });
 
       backendServer.on("error", (error) => {
-        const normalizedError =
-          error instanceof Error ? error : new Error(String(error));
-        server.config.logger.error(
-          `[hono-dev-proxy] backend error: ${normalizedError.message}`,
-        );
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        server.config.logger.error(`[hono-dev-proxy] backend error: ${normalizedError.message}`);
       });
       backendServer.listen(backendPort, backendHost);
 
       // 挂载到 Vite 中间件链：
       // - 路由命中 => 代理到后端
       // - 路由未命中 => next()，继续走 Vite 默认开发流程（静态资源/HMR/SPA fallback）
-      server.middlewares.use(
-        (req: IncomingMessage, res: ServerResponse, next: MiddlewareNext) => {
-          if (!loadedApp) {
-            next();
-            return;
-          }
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: MiddlewareNext) => {
+        if (!loadedApp) {
+          next();
+          return;
+        }
 
-          const method = req.method?.toUpperCase() ?? "GET";
-          const pathName = getRequestPathname(req);
-          if (!shouldProxyRequest(loadedApp, appRoutes, method, pathName)) {
-            next();
-            return;
-          }
+        const method = req.method?.toUpperCase() ?? "GET";
+        const rawPathName = getRequestPathname(req);
+        const pathName = stripTrailingSlashEnabled ? stripTrailingSlash(rawPathName) : rawPathName;
+        const requestPath = getProxyRequestPath(req, stripTrailingSlashEnabled);
+        const directMatchedRoutes = collectMatchedRouteKeys(loadedApp.router.match(method, pathName), appRoutes);
+        const fallbackMatchedRoutes =
+          method === "HEAD" ? collectMatchedRouteKeys(loadedApp.router.match("GET", pathName), appRoutes) : [];
+        const shouldProxy = shouldProxyRequest(loadedApp, appRoutes, method, pathName);
 
-          proxyToBackend(req, res, backendTarget, (error) => {
-            server.config.logger.error(
-              `[hono-dev-proxy] proxy error: ${error.message}`,
-            );
-          });
-        },
-      );
+        if (debugEnabled) {
+          const matchedRoutesForDebug =
+            method === "HEAD"
+              ? {
+                  direct: directMatchedRoutes,
+                  headFallbackGet: fallbackMatchedRoutes,
+                }
+              : directMatchedRoutes;
+          const matchedDebugText =
+            method === "HEAD" ? JSON.stringify(matchedRoutesForDebug, null, 2) : JSON.stringify(matchedRoutesForDebug);
+          server.config.logger.info(
+            `[hono-dev-proxy][debug] request:\n` +
+              `  method: ${method}\n` +
+              `  path: ${pathName}\n` +
+              `  rawPath: ${rawPathName}\n` +
+              `  matchedRoutes: ${matchedDebugText}\n` +
+              `  proxy: ${shouldProxy}`,
+          );
+        }
+
+        if (!shouldProxy) {
+          next();
+          return;
+        }
+
+        proxyToBackend(res, backendTarget, requestPath, req.method, req.headers, req, (error) => {
+          server.config.logger.error(`[hono-dev-proxy] proxy error: ${error.message}`);
+        });
+      });
 
       // Vite 关闭时回收后端服务，避免端口泄漏
       const closeBackendServer = () => {

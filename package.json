@@ -1,6 +1,6 @@
 {
   "name": "@igmainc/vite-plugin-hono-dev",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "A Vite plugin that dynamically proxies matched requests to a standalone Hono backend in dev",
   "type": "module",
   "license": "MIT",
