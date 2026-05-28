@@ -43,6 +43,8 @@ or
 npm i -D @igmainc/vite-plugin-hono-dev
 ```
 
+Supported Vite versions: `^6.0.0 || ^7.0.0 || ^8.0.0`.
+
 ## Quick Start
 
 ```ts
@@ -141,6 +143,7 @@ If you want a reference integration beyond the small examples in this repository
 ## Limitations
 
 - Dev-only plugin, not used in production build.
+- Supports Vite 6, 7, and 8. Vite 5 is not supported because this plugin relies on Vite's Environment API and `hotUpdate` module metadata.
 - Backend entry must be loadable via Vite SSR module loader.
 - WebSocket adapter injection is bound when the backend server starts; restart `vite dev` after changing the adapter wiring itself.
 - For release artifacts, use `bun run build` (tsup). `build:bun` is fallback-only.

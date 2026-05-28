@@ -43,6 +43,8 @@ bun add -d @igmainc/vite-plugin-hono-dev
 npm i -D @igmainc/vite-plugin-hono-dev
 ```
 
+支持的 Vite 版本：`^6.0.0 || ^7.0.0 || ^8.0.0`。
+
 ## 快速使用
 
 ```ts
@@ -141,6 +143,7 @@ bun run dev
 ## 限制与注意事项
 
 - 仅用于开发期，不参与生产构建。
+- 支持 Vite 6、7 和 8。由于插件依赖 Vite Environment API 和 `hotUpdate` 模块元数据，不支持 Vite 5。
 - 后端入口需可被 Vite SSR loader 正常加载。
 - WebSocket adapter 注入在后端服务启动时绑定；如果修改的是 adapter 接线本身，需要重启 `vite dev`。
 - 正式发布请使用 `bun run build`（tsup）。`build:bun` 仅用于备用验证。

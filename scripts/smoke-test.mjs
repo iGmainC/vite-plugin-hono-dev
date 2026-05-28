@@ -4,8 +4,10 @@ import * as http from "node:http";
 import * as net from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { createServer } from "vite";
 import { createRequire } from "node:module";
+
+const viteImportTarget = process.env.VITE_IMPORT_TARGET ?? "vite";
+const { createServer, version: viteVersion } = await import(viteImportTarget);
 
 const projectRoot = path.resolve(new URL("..", import.meta.url).pathname);
 const distMjs = path.join(projectRoot, "dist", "index.mjs");
@@ -295,6 +297,8 @@ const listenHttpServer = async (server, host = "127.0.0.1") => {
 };
 
 const run = async () => {
+  console.log(`smoke-test using vite@${viteVersion ?? "unknown"}`);
+
   await access(distMjs);
   await access(distCjs);
   await access(distDts);
