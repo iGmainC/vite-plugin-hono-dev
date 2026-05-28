@@ -23,8 +23,12 @@ The shared idea is to plug a server-side runtime into Vite's dev pipeline so fro
 ## Features
 
 - Dynamic route-aware proxying (`router.match` + `app.routes` intersection).
-- Hot-reload backend entry without restarting Vite.
+- Hot-reload backend entry and its SSR dependency graph without restarting Vite.
 - Supports `HEAD -> GET` matching fallback.
+- Preserves browser request semantics such as `Origin` while adding `X-Forwarded-*` proxy headers.
+- Supports prefixed Hono middleware routes such as `/api/*` without letting global middleware-only routes take over Vite fallback.
+- Proxies matched WebSocket upgrade requests when the backend entry exports an `injectWebSocket(server)` adapter hook.
+- Keeps Vite internal modules and existing Vite-served files out of Hono catch-all proxying.
 - Applies only in `vite dev` (`apply: "serve"`).
 
 ## Install
@@ -57,7 +61,7 @@ export default defineConfig({
 });
 ```
 
-The backend entry must export a Hono app via `default` export or named export `app`.
+The backend entry must export a Hono app via `default` export or named export `app`. For WebSocket routes, the entry may also export `injectWebSocket(server)`, for example from `@hono/node-ws`, so the plugin can bind the WebSocket adapter to the backend Node server.
 
 ## Options
 
@@ -66,8 +70,12 @@ type HonoDevProxyPluginOptions = {
   entry: string;
   port?: number; // default: 8787
   host?: string; // default: "localhost"
+  debug?: boolean; // default: false
+  stripTrailingSlash?: boolean; // default: false
 };
 ```
+
+By default, request paths keep their original trailing slash semantics so Hono route matching stays strict. Set `stripTrailingSlash: true` only when you intentionally want the older trailing-slash normalization behavior.
 
 ## How It Works
 
@@ -89,9 +97,12 @@ This project borrows the idea of integrating server-side logic into the Vite dev
 
 1. On startup, it loads the Hono backend entry with `ssrLoadModule`, so the backend can be resolved through Vite's SSR loader.
 2. Inside `configureServer`, it starts a standalone local Hono server with `@hono/node-server` and delegates request handling to the currently loaded Hono app.
-3. For each incoming Vite request, it checks `app.router.match()` and cross-validates the result against `app.routes`, proxying only real Hono route hits to the backend.
-4. When backend-related files change, it reloads the entry module in `hotUpdate`, replacing the in-memory app and route index without restarting Vite.
-5. Requests that do not match Hono routes stay in Vite's normal pipeline and continue through static asset serving, HMR, and SPA fallback.
+3. The backend server startup is awaited during Vite startup. If the configured backend host/port is unavailable, Vite startup fails instead of silently proxying to the wrong service.
+4. For each incoming Vite request, it first lets Vite internal modules and existing Vite-served files continue through Vite, then checks `app.router.match()` and cross-validates the result against `app.routes`, proxying only real Hono route hits to the backend. Prefixed middleware routes can be proxied, while global middleware-only routes are not used as the sole proxy signal.
+5. When backend SSR dependency files change, it reloads the entry module in `hotUpdate`, replacing the in-memory app and route index without restarting Vite.
+6. Proxied requests preserve the original `Origin` header and add `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` so the backend can distinguish browser origin from proxy target.
+7. Matched WebSocket upgrade requests are proxied to the backend server, while Vite's own HMR WebSocket remains in Vite's pipeline.
+8. Requests that do not match Hono routes stay in Vite's normal pipeline and continue through static asset serving, HMR, and SPA fallback.
 
 So this package should be read as inspired by `@cloudflare/vite-plugin` and borrowing its development model, not as a drop-in equivalent.
 
@@ -131,6 +142,7 @@ If you want a reference integration beyond the small examples in this repository
 
 - Dev-only plugin, not used in production build.
 - Backend entry must be loadable via Vite SSR module loader.
+- WebSocket adapter injection is bound when the backend server starts; restart `vite dev` after changing the adapter wiring itself.
 - For release artifacts, use `bun run build` (tsup). `build:bun` is fallback-only.
 
 ## Publish

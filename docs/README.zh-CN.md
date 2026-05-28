@@ -23,8 +23,12 @@
 ## 特性
 
 - 动态路由命中代理（`router.match` + `app.routes` 交叉校验）。
-- 后端入口热重载（无需重启 Vite）。
+- 后端入口及其 SSR 依赖图热重载（无需重启 Vite）。
 - 支持 `HEAD -> GET` 匹配回退。
+- 保留浏览器请求语义，例如原始 `Origin`，同时补充 `X-Forwarded-*` 代理头。
+- 支持 `/api/*` 一类带前缀的 Hono middleware 路由，但不会让全局 middleware-only 路由单独接管 Vite fallback。
+- 后端入口导出 `injectWebSocket(server)` 适配器钩子时，可代理命中的 WebSocket upgrade 请求。
+- Vite 内部模块和已存在的 Vite 静态/源码文件不会被 Hono catch-all 路由劫持。
 - 仅在 `vite dev` 生效（`apply: "serve"`）。
 
 ## 安装
@@ -57,7 +61,7 @@ export default defineConfig({
 });
 ```
 
-后端入口必须导出 Hono app：`default` 导出或命名导出 `app`。
+后端入口必须导出 Hono app：`default` 导出或命名导出 `app`。如果需要 WebSocket 路由，也可以额外导出 `injectWebSocket(server)`，例如来自 `@hono/node-ws` 的注入函数，让插件把 WebSocket adapter 绑定到底层 Node server。
 
 ## 配置项
 
@@ -66,8 +70,12 @@ type HonoDevProxyPluginOptions = {
   entry: string;
   port?: number; // 默认 8787
   host?: string; // 默认 "localhost"
+  debug?: boolean; // 默认 false
+  stripTrailingSlash?: boolean; // 默认 false
 };
 ```
+
+默认情况下，请求路径会保留原始尾斜杠语义，让 Hono 按严格路径匹配。只有明确需要旧的尾斜杠归一化行为时，才设置 `stripTrailingSlash: true`。
 
 ## 工作原理
 
@@ -89,9 +97,12 @@ type HonoDevProxyPluginOptions = {
 
 1. Vite 启动时，插件通过 `ssrLoadModule` 加载 Hono 后端入口，因此后端代码可以直接用 Vite 的 SSR loader 处理 TS / ESM。
 2. 在 `configureServer` 阶段，插件使用 `@hono/node-server` 启动一个独立的本地 Hono 服务，并把实际请求处理委托给当前加载的 Hono app。
-3. 对每个进入 Vite 的请求，插件先用 `app.router.match()` 和 `app.routes` 做交叉校验，只在真正命中 Hono 路由时才反向代理到后端。
-4. 后端相关文件变更时，插件在 `hotUpdate` 中重新加载入口模块，更新内存中的 Hono app 和路由索引，从而做到“不重启 Vite 也能刷新后端逻辑”。
-5. 没有命中 Hono 路由的请求会继续留在 Vite 默认流程里，仍然由静态资源服务、HMR 和 SPA fallback 处理。
+3. 后端服务启动会参与 Vite 启动握手。如果配置的后端 host/port 不可用，Vite 启动会直接失败，避免静默代理到错误服务。
+4. 对每个进入 Vite 的请求，插件会先放行 Vite 内部模块和已存在的 Vite 静态/源码文件，再用 `app.router.match()` 和 `app.routes` 做交叉校验，只在真正命中 Hono 路由时才反向代理到后端。带明确前缀的 middleware 路由可以被代理，全局 middleware-only 路由不会作为唯一代理依据。
+5. 后端 SSR 依赖文件变更时，插件在 `hotUpdate` 中重新加载入口模块，更新内存中的 Hono app 和路由索引，从而做到“不重启 Vite 也能刷新后端逻辑”。
+6. 被代理的请求会保留原始 `Origin` 请求头，并补充 `X-Forwarded-Host`、`X-Forwarded-Proto` 和 `X-Forwarded-For`，方便后端区分浏览器来源和代理目标。
+7. 命中 Hono 路由的 WebSocket upgrade 请求会代理到后端服务，Vite 自己的 HMR WebSocket 仍保留在 Vite 流程中。
+8. 没有命中 Hono 路由的请求会继续留在 Vite 默认流程里，仍然由静态资源服务、HMR 和 SPA fallback 处理。
 
 所以，这个插件并不是 `@cloudflare/vite-plugin` 的等价替代品，而是借鉴了它的开发模型：让前端 dev server 和服务端运行时协同工作，再根据 Hono + Node 的场景做了更轻量的实现。
 
@@ -131,6 +142,7 @@ bun run dev
 
 - 仅用于开发期，不参与生产构建。
 - 后端入口需可被 Vite SSR loader 正常加载。
+- WebSocket adapter 注入在后端服务启动时绑定；如果修改的是 adapter 接线本身，需要重启 `vite dev`。
 - 正式发布请使用 `bun run build`（tsup）。`build:bun` 仅用于备用验证。
 
 ## 发布流程
