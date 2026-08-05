@@ -28,6 +28,7 @@ The shared idea is to plug a server-side runtime into Vite's dev pipeline so fro
 - Supports `HEAD -> GET` matching fallback.
 - Preserves browser request semantics such as `Origin` while adding `X-Forwarded-*` proxy headers.
 - Supports prefixed Hono middleware routes such as `/api/*` without letting global middleware-only routes take over Vite fallback.
+- Supports exact `proxyHosts` overrides for apps that dispatch internal services from global Host-based middleware.
 - Proxies matched WebSocket requests through a runtime-neutral bridge when the backend entry exports the matching Node or Bun WebSocket adapter.
 - Keeps Vite internal modules and existing Vite-served files out of Hono catch-all proxying.
 - Applies only in `vite dev` (`apply: "serve"`).
@@ -59,6 +60,7 @@ export default defineConfig({
       entry: "../backend/src/server.ts",
       host: "127.0.0.1",
       port: 8787,
+      proxyHosts: ["my-service.internal"],
     }),
   ],
 });
@@ -78,6 +80,7 @@ type HonoDevProxyPluginOptions = {
   entry: string;
   port?: number; // default: 8787
   host?: string; // default: "localhost"
+  proxyHosts?: readonly string[]; // exact hostname matches; ports are ignored
   runtime?: "auto" | "node" | "bun"; // default: "auto"
   debug?: boolean; // default: false
   stripTrailingSlash?: boolean; // default: false
@@ -85,6 +88,28 @@ type HonoDevProxyPluginOptions = {
 ```
 
 By default, request paths keep their original trailing slash semantics so Hono route matching stays strict. Set `stripTrailingSlash: true` only when you intentionally want the older trailing-slash normalization behavior.
+
+### Host-based routing
+
+Use `proxyHosts` when the Hono app dispatches internal services from global middleware based on the request Host and therefore cannot expose every pathname as an explicit endpoint:
+
+```ts
+honoDevProxyPlugin({
+  entry: "./src/dev-app.ts",
+  proxyHosts: ["my-vfs.internal", "my-agent.internal"],
+});
+```
+
+Configured values and incoming Host headers are normalized as hostnames: ports are ignored and matching is case-insensitive. Matching is exact in v1; wildcards, suffix patterns, regular expressions, and URL values are rejected. The plugin also adds the normalized configured hostnames to Vite's `server.allowedHosts` unless that option is already `true`.
+
+The decision order is intentionally strict:
+
+1. Vite internal paths, Vite HMR WebSockets, and real files under the Vite root or `publicDir` stay in Vite.
+2. An exact `proxyHosts` match is proxied even when the pathname has no explicit Hono route. The normalized Host authority is forwarded so the backend global middleware can dispatch it.
+3. Other requests retain the existing route-aware `router.match()` + `app.routes` behavior.
+4. Unmatched requests continue to Vite's SPA/static fallback.
+
+The same rule applies to HTTP and WebSocket upgrades. `proxyHosts` is a narrow opt-in override; it does not turn every global `app.use("*")` middleware into a proxy-all signal.
 
 ### Runtime selection
 
@@ -117,10 +142,10 @@ This project borrows the idea of integrating server-side logic into the Vite dev
 1. On startup, it loads the Hono backend entry with `ssrLoadModule`, so the backend can be resolved through Vite's SSR loader.
 2. Inside `configureServer`, it starts a standalone local Hono server with `@hono/node-server` or `Bun.serve()`, according to the resolved runtime, and delegates request handling to the currently loaded Hono app.
 3. The backend server startup is awaited during Vite startup. If the configured backend host/port is unavailable, Vite startup fails instead of silently proxying to the wrong service.
-4. For each incoming Vite request, it first lets Vite internal modules and existing Vite-served files continue through Vite, then checks `app.router.match()` and cross-validates the result against `app.routes`, proxying only real Hono route hits to the backend. Prefixed middleware routes can be proxied, while global middleware-only routes are not used as the sole proxy signal.
+4. For each incoming Vite request, it first lets Vite internal modules and existing Vite-served files continue through Vite. It then applies an exact configured `proxyHosts` override before checking `app.router.match()` and cross-validating the result against `app.routes`. Prefixed middleware routes can be proxied, while global middleware-only routes are not used as a proxy-all signal by themselves.
 5. When backend SSR dependency files change, it reloads the entry module in `hotUpdate`, replacing the in-memory app and route index without restarting Vite.
 6. Proxied requests preserve the original `Origin` header and add `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` so the backend can distinguish browser origin from proxy target.
-7. Matched WebSocket upgrade requests are proxied to the backend server, while Vite's own HMR WebSocket remains in Vite's pipeline.
+7. Route-matched or exact Host-matched WebSocket upgrade requests are proxied to the backend server, while Vite's own HMR WebSocket remains in Vite's pipeline.
 8. Requests that do not match Hono routes stay in Vite's normal pipeline and continue through static asset serving, HMR, and SPA fallback.
 
 So this package should be read as inspired by `@cloudflare/vite-plugin` and borrowing its development model, not as a drop-in equivalent.

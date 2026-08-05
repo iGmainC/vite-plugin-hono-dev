@@ -22,6 +22,20 @@ const assert = (condition, message) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 使用原生 HTTP 客户端发送可控 Host；fetch 会保护 Host header，不能用于该回归场景 */
+const requestHttpText = async (requestUrl, hostHeader) =>
+  new Promise((resolve, reject) => {
+    const request = http.request(requestUrl, { headers: { host: hostHeader } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
+      });
+    });
+    request.on("error", reject);
+    request.end();
+  });
+
 /** 获取一个当前可用端口，用于隔离每个 smoke 场景 */
 const getFreePort = async () => {
   return new Promise((resolve, reject) => {
@@ -94,7 +108,7 @@ const parseTextFrames = (buffer) => {
 };
 
 /** 通过原生 TCP 执行 WebSocket 握手和 echo 验证，避免新增 smoke 客户端依赖 */
-const requestWebSocketEcho = async (wsUrl, payload) => {
+const requestWebSocketEcho = async (wsUrl, payload, { hostHeader, expectedMessage = `echo:${payload}` } = {}) => {
   const url = new URL(wsUrl);
   const key = randomBytes(16).toString("base64");
   const expectedAccept = createHash("sha1")
@@ -122,7 +136,7 @@ const requestWebSocketEcho = async (wsUrl, payload) => {
       socket.write(
         [
           `GET ${requestPath} HTTP/1.1`,
-          `Host: ${url.host}`,
+          `Host: ${hostHeader ?? url.host}`,
           "Upgrade: websocket",
           "Connection: Upgrade",
           `Sec-WebSocket-Key: ${key}`,
@@ -150,11 +164,53 @@ const requestWebSocketEcho = async (wsUrl, payload) => {
       const parsed = parseTextFrames(buffer);
       buffer = parsed.remaining;
       messages.push(...parsed.messages);
-      if (messages.includes(`echo:${payload}`)) {
+      if (messages.includes(expectedMessage)) {
         finish();
       }
     });
 
+    socket.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+};
+
+/** 发起 WebSocket 握手并返回是否升级成功，用于验证未命中 Host 不会进入后端 */
+const requestWebSocketUpgradeStatus = async (wsUrl, { hostHeader } = {}) => {
+  const url = new URL(wsUrl);
+  const key = randomBytes(16).toString("base64");
+
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(Number(url.port), url.hostname);
+    let buffer = "";
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, 1000);
+
+    socket.on("connect", () => {
+      socket.write(
+        [
+          `GET ${url.pathname}${url.search} HTTP/1.1`,
+          `Host: ${hostHeader ?? url.host}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          `Sec-WebSocket-Key: ${key}`,
+          "Sec-WebSocket-Version: 13",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve(buffer.startsWith("HTTP/1.1 101"));
+    });
     socket.on("error", (error) => {
       clearTimeout(timeout);
       reject(error);
@@ -252,6 +308,31 @@ app.get("/api/ws", upgradeWebSocket(() => ({
   );
 };
 
+/** 写入仅依赖全局中间件和 Host 分发的 app，确保测试不被显式 pathname 路由误命中 */
+const writeHostRoutedAppFile = async (file) => {
+  await writeFile(
+    file,
+    `
+import { Hono } from "hono";
+import { createNodeWebSocket } from "@hono/node-ws";
+export const app = new Hono();
+export const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+const websocketHandler = upgradeWebSocket(() => ({
+  onMessage: (event, ws) => ws.send("host-echo:" + String(event.data)),
+}));
+app.use("*", async (c, next) => {
+  const hostname = new URL("http://" + c.req.header("host")).hostname.toLowerCase();
+  if (hostname !== "neo-noumi-vfs.internal") return next();
+  if (c.req.header("upgrade")?.toLowerCase() === "websocket") {
+    return websocketHandler(c, next);
+  }
+  return c.text("host:" + hostname + c.req.path);
+});
+`,
+    "utf8",
+  );
+};
+
 /** 写入前后端同目录文件，用于验证前端 HMR 不会被后端热更新逻辑吞掉 */
 const writeFrontendHmrFiles = async ({ entryFile, mainFile, indexFile }) => {
   await writeFile(
@@ -269,7 +350,7 @@ export default app;
 };
 
 /** 创建测试专用 Vite dev server，统一关闭依赖扫描以减少无关噪声 */
-const createViteServer = async ({ root, plugin }) => {
+const createViteServer = async ({ root, plugin, allowedHosts }) => {
   return createServer({
     root,
     logLevel: "error",
@@ -280,6 +361,7 @@ const createViteServer = async ({ root, plugin }) => {
     server: {
       host: "127.0.0.1",
       port: 0,
+      ...(allowedHosts === undefined ? {} : { allowedHosts }),
     },
     appType: "spa",
   });
@@ -312,6 +394,17 @@ const run = async () => {
 
   const dtsContent = await readFile(distDts, "utf8");
   assert(dtsContent.includes("HonoDevProxyPluginOptions"), "Type declaration should include options type");
+  assert(dtsContent.includes("proxyHosts?: readonly string[]"), "Type declaration should expose proxyHosts");
+
+  let wildcardProxyHostRejected = false;
+  try {
+    esmModule.default({ entry: "server.ts", proxyHosts: ["*.internal"] });
+  } catch (error) {
+    wildcardProxyHostRejected = true;
+    const message = error instanceof Error ? error.message : String(error);
+    assert(message.includes("expected an exact hostname"), "Wildcard proxyHosts should produce a precise error");
+  }
+  assert(wildcardProxyHostRejected, "proxyHosts must reject wildcard entries");
 
   const smokeBase = path.join(projectRoot, ".tmp-smoke");
   await mkdir(smokeBase, { recursive: true });
@@ -324,6 +417,7 @@ const run = async () => {
   const slashCompatRoot = await mkdtemp(path.join(smokeBase, "slash-compat-"));
   const frontendHmrRoot = await mkdtemp(path.join(smokeBase, "frontend-hmr-"));
   const websocketRoot = await mkdtemp(path.join(smokeBase, "websocket-"));
+  const proxyHostRoot = await mkdtemp(path.join(smokeBase, "proxy-host-"));
 
   try {
     const entryFile = path.join(tempRoot, "server.ts");
@@ -526,6 +620,84 @@ const run = async () => {
       await websocketServer.close();
     }
 
+    await mkdir(path.join(proxyHostRoot, "src"), { recursive: true });
+    const proxyHostEntry = path.join(proxyHostRoot, "server.ts");
+    await writeHostRoutedAppFile(proxyHostEntry);
+    await writeFile(path.join(proxyHostRoot, "index.html"), "<html><body>host fallback</body></html>", "utf8");
+    await writeFile(path.join(proxyHostRoot, "src", "main.ts"), `console.log("host frontend");\n`, "utf8");
+
+    const proxyHostServer = await createViteServer({
+      root: proxyHostRoot,
+      // 该场景同时验证未配置 Host 的 Vite fallback，因此测试层显式允许这些探针 Host。
+      allowedHosts: true,
+      plugin: esmModule.default({
+        entry: proxyHostEntry,
+        host: "127.0.0.1",
+        port: await getFreePort(),
+        // 配置值也按 hostname 规范化，端口不参与精确匹配。
+        proxyHosts: ["NEO-NOUMI-VFS.INTERNAL:9999"],
+      }),
+    });
+    await proxyHostServer.listen();
+
+    try {
+      const address = proxyHostServer.httpServer?.address();
+      assert(address && typeof address !== "string", "proxyHosts Vite server should expose address info");
+      const base = `http://127.0.0.1:${address.port}`;
+      const matchingHost = `NeO-NoUmI-VfS.InTeRnAl:${address.port}`;
+
+      const hostResponse = await requestHttpText(`${base}/internal/arbitrary`, matchingHost);
+      assert(
+        hostResponse.text === "host:neo-noumi-vfs.internal/internal/arbitrary",
+        `Configured Host should proxy an unregistered pathname and preserve Host for Hono middleware; received ${hostResponse.status} ${hostResponse.text}`,
+      );
+
+      const fallbackResponse = await requestHttpText(
+        `${base}/internal/arbitrary`,
+        `unconfigured.internal:${address.port}`,
+      );
+      assert(fallbackResponse.text.includes("host fallback"), "Unconfigured Host should keep Vite fallback");
+
+      const similarHostResponse = await requestHttpText(
+        `${base}/internal/arbitrary`,
+        `evil-neo-noumi-vfs.internal:${address.port}`,
+      );
+      assert(
+        similarHostResponse.text.includes("host fallback"),
+        "Similar hostname must not match exact proxyHosts entries",
+      );
+
+      const viteClientResponse = await requestHttpText(`${base}/@vite/client`, matchingHost);
+      assert(
+        viteClientResponse.text.includes("createHotContext"),
+        "Configured Host must not bypass Vite internal request protection",
+      );
+
+      const sourceResponse = await requestHttpText(`${base}/src/main.ts`, matchingHost);
+      assert(
+        sourceResponse.text.includes("host frontend"),
+        "Configured Host must not bypass real frontend file protection",
+      );
+
+      const hostWebSocketMessages = await requestWebSocketEcho(
+        `ws://127.0.0.1:${address.port}/internal/ws`,
+        "proxy-host-ws",
+        { hostHeader: matchingHost, expectedMessage: "host-echo:proxy-host-ws" },
+      );
+      assert(
+        hostWebSocketMessages.includes("host-echo:proxy-host-ws"),
+        "Configured Host should proxy an unregistered WebSocket pathname",
+      );
+
+      const similarHostUpgraded = await requestWebSocketUpgradeStatus(
+        `ws://127.0.0.1:${address.port}/internal/ws`,
+        { hostHeader: `evil-neo-noumi-vfs.internal:${address.port}` },
+      );
+      assert(!similarHostUpgraded, "Unconfigured WebSocket Host should stay in the Vite pipeline");
+    } finally {
+      await proxyHostServer.close();
+    }
+
     await mkdir(path.join(catchAllRoot, "src"), { recursive: true });
     const catchAllEntry = path.join(catchAllRoot, "server.ts");
     await writeCatchAllAppFile(catchAllEntry);
@@ -655,6 +827,7 @@ const run = async () => {
     await rm(slashCompatRoot, { recursive: true, force: true });
     await rm(frontendHmrRoot, { recursive: true, force: true });
     await rm(websocketRoot, { recursive: true, force: true });
+    await rm(proxyHostRoot, { recursive: true, force: true });
   }
 
   console.log("smoke-test passed");

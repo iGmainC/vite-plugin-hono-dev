@@ -1,5 +1,6 @@
 import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import * as net from "node:net";
+import * as http from "node:http";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "vite";
@@ -11,6 +12,18 @@ const distMjs = path.join(projectRoot, "dist", "index.mjs");
 const assert = (condition, message) => {
   if (!condition) throw new Error(message);
 };
+
+/** 使用原生客户端保留测试 Host，避免 fetch 重写受保护的 Host header */
+const requestHttpText = async (requestUrl, hostHeader) =>
+  new Promise((resolve, reject) => {
+    const request = http.request(requestUrl, { headers: { host: hostHeader } }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    request.on("error", reject);
+    request.end();
+  });
 
 /** 获取隔离端口，避免 runtime smoke 相互干扰 */
 const getFreePort = async () =>
@@ -83,6 +96,11 @@ import { Database } from "bun:sqlite";
 import { upgradeWebSocket, websocket } from "hono/bun";
 const database = new Database(":memory:");
 const app = new Hono();
+app.use("*", async (c, next) => {
+  const hostname = new URL("http://" + c.req.header("host")).hostname.toLowerCase();
+  if (hostname === "runtime.internal") return c.text("host:" + hostname + c.req.path);
+  return next();
+});
 app.get("/runtime", (c) => c.json(database.query("select 'bun' as host").get()));
 app.get("/runtime/ws", upgradeWebSocket(() => ({
   onMessage: (event, socket) => socket.send("echo:" + String(event.data)),
@@ -101,6 +119,7 @@ export default app;
         host: "127.0.0.1",
         port: await getFreePort(),
         runtime,
+        proxyHosts: ["RUNTIME.INTERNAL:5173"],
       }),
     });
     try {
@@ -110,6 +129,15 @@ export default app;
       assert(response.status === 200, `${runtime} Bun backend should respond`);
       const payload = await response.json();
       assert(payload.host === "bun", `${runtime} should load the backend entry in the Bun host`);
+
+      const hostResponse = await requestHttpText(
+        `http://127.0.0.1:${address.port}/host-only/arbitrary`,
+        `runtime.internal:${address.port}`,
+      );
+      assert(
+        hostResponse === "host:runtime.internal/host-only/arbitrary",
+        `${runtime} should proxy exact Host middleware routes under Bun; received ${hostResponse}`,
+      );
 
       const websocketMessage = await requestWebSocketEcho(`ws://127.0.0.1:${address.port}/runtime/ws`, "bun-ws");
       assert(websocketMessage === "echo:bun-ws", `${runtime} should proxy Bun WebSocket upgrades`);

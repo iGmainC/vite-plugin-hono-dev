@@ -28,6 +28,7 @@
 - 支持 `HEAD -> GET` 匹配回退。
 - 保留浏览器请求语义，例如原始 `Origin`，同时补充 `X-Forwarded-*` 代理头。
 - 支持 `/api/*` 一类带前缀的 Hono middleware 路由，但不会让全局 middleware-only 路由单独接管 Vite fallback。
+- 支持精确 `proxyHosts` override，供通过全局 Host 中间件分发内部服务的应用使用。
 - 后端入口导出对应的 Node 或 Bun WebSocket adapter 时，通过运行时无关的桥接层代理命中的 WebSocket 请求。
 - Vite 内部模块和已存在的 Vite 静态/源码文件不会被 Hono catch-all 路由劫持。
 - 仅在 `vite dev` 生效（`apply: "serve"`）。
@@ -59,6 +60,7 @@ export default defineConfig({
       entry: "../backend/src/server.ts",
       host: "127.0.0.1",
       port: 8787,
+      proxyHosts: ["my-service.internal"],
     }),
   ],
 });
@@ -78,6 +80,7 @@ type HonoDevProxyPluginOptions = {
   entry: string;
   port?: number; // 默认 8787
   host?: string; // 默认 "localhost"
+  proxyHosts?: readonly string[]; // 精确 hostname；匹配时忽略端口
   runtime?: "auto" | "node" | "bun"; // 默认 "auto"
   debug?: boolean; // 默认 false
   stripTrailingSlash?: boolean; // 默认 false
@@ -85,6 +88,28 @@ type HonoDevProxyPluginOptions = {
 ```
 
 默认情况下，请求路径会保留原始尾斜杠语义，让 Hono 按严格路径匹配。只有明确需要旧的尾斜杠归一化行为时，才设置 `stripTrailingSlash: true`。
+
+### 按 Host 路由
+
+如果 Hono 应用通过全局中间件读取请求 Host 来分发内部服务，无法把所有 pathname 注册成显式 endpoint，可以配置 `proxyHosts`：
+
+```ts
+honoDevProxyPlugin({
+  entry: "./src/dev-app.ts",
+  proxyHosts: ["my-vfs.internal", "my-agent.internal"],
+});
+```
+
+配置值和请求 Host 都会按 hostname 标准化：忽略端口、大小写不敏感。v1 仅支持精确 hostname；通配符、后缀模式、正则和 URL 值会被拒绝。除非调用方已经把 Vite `server.allowedHosts` 设置为 `true`，插件还会把标准化后的 hostname 加入 Vite 的 Host allowlist。
+
+代理判定顺序保持严格：
+
+1. Vite 内部路径、Vite HMR WebSocket，以及 Vite root / `publicDir` 下真实存在的文件继续留在 Vite。
+2. 精确命中 `proxyHosts` 时，即使 pathname 没有显式 Hono route 也会代理；标准化后的 Host authority 会传给后端全局中间件。
+3. 其他请求继续使用已有的 `router.match()` + `app.routes` route-aware 判定。
+4. 最终未命中的请求继续进入 Vite SPA / 静态资源 fallback。
+
+HTTP 与 WebSocket upgrade 共用这套语义。`proxyHosts` 是窄范围的显式 override，并不等价于把所有全局 `app.use("*")` 中间件都变成“代理全部请求”的信号。
 
 ### 运行时选择
 
@@ -117,10 +142,10 @@ type HonoDevProxyPluginOptions = {
 1. Vite 启动时，插件通过 `ssrLoadModule` 加载 Hono 后端入口，因此后端代码可以直接用 Vite 的 SSR loader 处理 TS / ESM。
 2. 在 `configureServer` 阶段，插件根据解析出的运行时，使用 `@hono/node-server` 或 `Bun.serve()` 启动一个独立的本地 Hono 服务，并把实际请求处理委托给当前加载的 Hono app。
 3. 后端服务启动会参与 Vite 启动握手。如果配置的后端 host/port 不可用，Vite 启动会直接失败，避免静默代理到错误服务。
-4. 对每个进入 Vite 的请求，插件会先放行 Vite 内部模块和已存在的 Vite 静态/源码文件，再用 `app.router.match()` 和 `app.routes` 做交叉校验，只在真正命中 Hono 路由时才反向代理到后端。带明确前缀的 middleware 路由可以被代理，全局 middleware-only 路由不会作为唯一代理依据。
+4. 对每个进入 Vite 的请求，插件会先放行 Vite 内部模块和已存在的 Vite 静态/源码文件，再应用显式配置的精确 `proxyHosts` override，最后用 `app.router.match()` 和 `app.routes` 做交叉校验。带明确前缀的 middleware 路由可以被代理，全局 middleware-only 路由本身不会成为“代理全部请求”的信号。
 5. 后端 SSR 依赖文件变更时，插件在 `hotUpdate` 中重新加载入口模块，更新内存中的 Hono app 和路由索引，从而做到“不重启 Vite 也能刷新后端逻辑”。
 6. 被代理的请求会保留原始 `Origin` 请求头，并补充 `X-Forwarded-Host`、`X-Forwarded-Proto` 和 `X-Forwarded-For`，方便后端区分浏览器来源和代理目标。
-7. 命中 Hono 路由的 WebSocket upgrade 请求会代理到后端服务，Vite 自己的 HMR WebSocket 仍保留在 Vite 流程中。
+7. 命中 Hono 路由或精确 Host 的 WebSocket upgrade 请求会代理到后端服务，Vite 自己的 HMR WebSocket 仍保留在 Vite 流程中。
 8. 没有命中 Hono 路由的请求会继续留在 Vite 默认流程里，仍然由静态资源服务、HMR 和 SPA fallback 处理。
 
 所以，这个插件并不是 `@cloudflare/vite-plugin` 的等价替代品，而是借鉴了它的开发模型：让前端 dev server 和服务端运行时协同工作，再根据 Hono + Node 的场景做了更轻量的实现。

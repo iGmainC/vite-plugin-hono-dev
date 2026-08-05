@@ -29,6 +29,8 @@ export interface HonoDevProxyPluginOptions {
   entry: string;
   port?: number;
   host?: string;
+  /** 精确匹配这些 hostname 时，即使路径未命中显式 Hono route 也代理 */
+  proxyHosts?: readonly string[];
   runtime?: HonoDevRuntime;
   debug?: boolean;
   stripTrailingSlash?: boolean;
@@ -39,6 +41,20 @@ export type HonoDevRuntime = "auto" | "node" | "bun";
 
 /** 插件实际解析出的后端运行时 */
 type ResolvedHonoDevRuntime = Exclude<HonoDevRuntime, "auto">;
+
+/** 单次请求的代理判定；Host 命中时需要把标准化 authority 传给后端中间件 */
+type ProxyDecision = {
+  shouldProxy: boolean;
+  reason?: "host" | "route";
+  requestHostname?: string;
+  normalizedHost?: string;
+};
+
+/** 标准化后的 Host authority 与 hostname */
+type NormalizedHost = {
+  authority: string;
+  hostname: string;
+};
 
 /**
  * Hono 路由匹配结果类型：
@@ -292,6 +308,47 @@ const getFirstHeaderValue = (headerValue: string | string[] | undefined): string
   return headerValue;
 };
 
+/**
+ * 将 HTTP authority 规范化为精确 hostname：
+ * - 忽略端口并统一小写
+ * - 拒绝协议、认证信息、路径、查询和 hash，避免把过宽输入误当成 hostname
+ */
+const normalizeHost = (hostValue: string): NormalizedHost | undefined => {
+  const authority = hostValue.trim();
+  if (!authority) return undefined;
+
+  try {
+    const url = new URL(`http://${authority}`);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) return undefined;
+    return {
+      authority: url.host.toLowerCase(),
+      hostname: url.hostname.toLowerCase(),
+    };
+  } catch {
+    return undefined;
+  }
+};
+
+/** 校验并规范化 proxyHosts；v1 仅支持精确 hostname，不接受通配符或 URL */
+const normalizeProxyHosts = (proxyHosts: readonly string[] | undefined): ReadonlySet<string> => {
+  if (proxyHosts === undefined) return new Set<string>();
+  if (!Array.isArray(proxyHosts)) {
+    throw new Error('[hono-dev-proxy] "proxyHosts" must be an array of exact hostnames.');
+  }
+
+  const normalizedHosts = new Set<string>();
+  for (const host of proxyHosts) {
+    const normalizedHost = typeof host === "string" ? normalizeHost(host) : undefined;
+    if (!normalizedHost || normalizedHost.hostname.includes("*") || normalizedHost.hostname.startsWith(".")) {
+      throw new Error(
+        `[hono-dev-proxy] invalid proxyHosts entry "${String(host)}"; expected an exact hostname with an optional port.`,
+      );
+    }
+    normalizedHosts.add(normalizedHost.hostname);
+  }
+  return normalizedHosts;
+};
+
 /** 追加 X-Forwarded-For，保留上游代理已经写入的来源链 */
 const appendForwardedFor = (currentValue: string | string[] | undefined, remoteAddress: string | undefined): string => {
   const current = getFirstHeaderValue(currentValue);
@@ -312,13 +369,15 @@ const buildProxyRequestHeaders = (
   targetUrl: URL,
   requestHeaders: IncomingMessage["headers"],
   requestStream: IncomingMessage,
+  normalizedHost: string | undefined,
 ): IncomingMessage["headers"] => {
   const forwardedFor = appendForwardedFor(requestHeaders["x-forwarded-for"], requestStream.socket.remoteAddress);
+  const originalHost = getFirstHeaderValue(requestHeaders.host);
   return {
     ...requestHeaders,
-    // Host 指向真实后端服务；原始 Host 通过 x-forwarded-host 保留。
-    host: targetUrl.host,
-    "x-forwarded-host": getFirstHeaderValue(requestHeaders.host) ?? targetUrl.host,
+    // Host 路由传递标准化 authority；普通 route-aware 代理继续使用后端 target。
+    host: normalizedHost ?? targetUrl.host,
+    "x-forwarded-host": originalHost ?? targetUrl.host,
     "x-forwarded-proto": getForwardedProto(requestStream),
     ...(forwardedFor ? { "x-forwarded-for": forwardedFor } : {}),
   };
@@ -352,7 +411,7 @@ const hasRouteMatch = (matchedResult: MatchedRouteResult, appRoutes: ReadonlySet
  * 1. 先按原始 method 匹配
  * 2. 对 HEAD 做 GET 回退（很多框架会复用 GET 处理 HEAD）
  */
-const shouldProxyRequest = (
+const shouldProxyRoute = (
   app: HonoLikeApp,
   appRoutes: ReadonlySet<string>,
   method: string,
@@ -368,6 +427,43 @@ const shouldProxyRequest = (
 };
 
 /**
+ * 统一 HTTP 与 WebSocket 的代理判定：
+ * - 精确 Host 命中优先，允许全局中间件处理任意 pathname
+ * - Host 未命中时维持原有 route-aware 语义
+ */
+const getProxyDecision = (
+  app: HonoLikeApp,
+  appRoutes: ReadonlySet<string>,
+  method: string,
+  pathName: string,
+  requestHeaders: IncomingMessage["headers"],
+  proxyHosts: ReadonlySet<string>,
+): ProxyDecision => {
+  const rawHost = getFirstHeaderValue(requestHeaders.host);
+  const normalizedHost = rawHost ? normalizeHost(rawHost) : undefined;
+  const requestHostname = normalizedHost?.hostname;
+  if (requestHostname && proxyHosts.has(requestHostname)) {
+    return {
+      shouldProxy: true,
+      reason: "host",
+      requestHostname,
+      normalizedHost: normalizedHost.authority,
+    };
+  }
+  if (shouldProxyRoute(app, appRoutes, method, pathName)) {
+    return { shouldProxy: true, reason: "route", requestHostname };
+  }
+  return { shouldProxy: false, requestHostname };
+};
+
+/** 读取 WebSocket 子协议；Vite HMR 使用 vite-hmr，必须留在 Vite 自身 upgrade 流程 */
+const getRequestedWebSocketProtocols = (requestHeaders: IncomingMessage["headers"]): string[] =>
+  (getFirstHeaderValue(requestHeaders["sec-websocket-protocol"]) ?? "")
+    .split(",")
+    .map((protocol) => protocol.trim())
+    .filter(Boolean);
+
+/**
  * 反向代理到后端 Hono 服务：
  * - 透传 method/path/query/header
  * - 回写后端响应状态码、响应头与响应体
@@ -380,6 +476,7 @@ const proxyToBackend = (
   requestMethod: string | undefined,
   requestHeaders: IncomingMessage["headers"],
   requestStream: IncomingMessage,
+  normalizedHost: string | undefined,
   onError: (error: Error) => void,
 ): void => {
   const targetUrl = new URL(requestPath, targetOrigin);
@@ -391,7 +488,7 @@ const proxyToBackend = (
     port: targetUrl.port,
     method: requestMethod,
     path: `${targetUrl.pathname}${targetUrl.search}`,
-    headers: buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream),
+    headers: buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream, normalizedHost),
   };
   const proxyRequest = (isSecure ? https : http).request(requestOptions, (proxyResponse) => {
     // 将后端状态码与状态文本透传给 Vite 当前请求
@@ -446,20 +543,22 @@ const proxyWebSocketToBackend = (
   targetOrigin: string,
   requestPath: string,
   requestHeaders: IncomingMessage["headers"],
+  normalizedHost: string | undefined,
   onError: (error: Error) => void,
 ): void => {
   const targetUrl = new URL(requestPath, targetOrigin);
   targetUrl.protocol = targetUrl.protocol === "https:" ? "wss:" : "ws:";
-  const proxyHeaders = buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream);
+  const proxyHeaders = buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream, normalizedHost);
   const backendHeaders = Object.fromEntries(
     Object.entries(proxyHeaders).filter(([headerName, headerValue]) => {
-      return headerValue !== undefined && !GENERATED_WEBSOCKET_HEADERS.has(headerName.toLowerCase());
+      if (headerValue === undefined) return false;
+      const normalizedHeaderName = headerName.toLowerCase();
+      // ws 可用显式 Host 覆盖其自动生成值；其他握手头仍由 ws 负责。
+      if (normalizedHost && normalizedHeaderName === "host") return true;
+      return !GENERATED_WEBSOCKET_HEADERS.has(normalizedHeaderName);
     }),
   );
-  const requestedProtocols = (getFirstHeaderValue(requestHeaders["sec-websocket-protocol"]) ?? "")
-    .split(",")
-    .map((protocol) => protocol.trim())
-    .filter(Boolean);
+  const requestedProtocols = getRequestedWebSocketProtocols(requestHeaders);
   // 前端 ws server 默认选择首个协议，后端也只协商同一个值，避免两侧协议不一致。
   const selectedProtocol = requestedProtocols[0];
 
@@ -537,6 +636,7 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
   const debugEnabled = options.debug ?? false;
   const stripTrailingSlashEnabled = options.stripTrailingSlash ?? false;
   const configuredRuntime = options.runtime ?? DEFAULT_RUNTIME;
+  const proxyHosts = normalizeProxyHosts(options.proxyHosts);
   // 同步接管 Vite upgrade socket，再与后端建立独立 WebSocket 连接。
   const websocketBridgeServer = new WebSocketServer({ noServer: true });
 
@@ -777,6 +877,15 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
   return {
     name: "hono-dev-proxy-plugin",
     apply: "serve",
+    config(config) {
+      if (proxyHosts.size === 0 || config.server?.allowedHosts === true) return;
+      // Vite 的 Host 安全检查早于插件中间件；仅放行显式 proxyHosts，避免调用方维护第二份配置。
+      return {
+        server: {
+          allowedHosts: [...(config.server?.allowedHosts ?? []), ...proxyHosts],
+        },
+      };
+    },
     configResolved(config: ResolvedConfig) {
       // 以 Vite root 为基准解析入口，避免 cwd 差异
       entryPath = path.resolve(config.root, options.entry);
@@ -811,13 +920,25 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
 
         const rawPathName = getRequestPathname(req);
         const pathName = stripTrailingSlashEnabled ? stripTrailingSlash(rawPathName) : rawPathName;
+        if (getRequestedWebSocketProtocols(req.headers).includes("vite-hmr")) return;
         if (shouldBypassProxy(rawPathName, server.config)) return;
-        if (!shouldProxyRequest(loadedApp, appRoutes, "GET", pathName)) return;
+        const proxyDecision = getProxyDecision(loadedApp, appRoutes, "GET", pathName, req.headers, proxyHosts);
+        if (!proxyDecision.shouldProxy) return;
 
         const requestPath = getProxyRequestPath(req, stripTrailingSlashEnabled);
-        proxyWebSocketToBackend(websocketBridgeServer, req, socket, head, backendTarget, requestPath, req.headers, (error) => {
-          server.config.logger.error(`[hono-dev-proxy] websocket proxy error: ${error.message}`);
-        });
+        proxyWebSocketToBackend(
+          websocketBridgeServer,
+          req,
+          socket,
+          head,
+          backendTarget,
+          requestPath,
+          req.headers,
+          proxyDecision.normalizedHost,
+          (error) => {
+            server.config.logger.error(`[hono-dev-proxy] websocket proxy error: ${error.message}`);
+          },
+        );
       };
 
       server.httpServer?.on("upgrade", handleWebSocketUpgrade);
@@ -843,7 +964,7 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
         const directMatchedRoutes = collectMatchedRouteKeys(loadedApp.router.match(method, pathName), appRoutes);
         const fallbackMatchedRoutes =
           method === "HEAD" ? collectMatchedRouteKeys(loadedApp.router.match("GET", pathName), appRoutes) : [];
-        const shouldProxy = shouldProxyRequest(loadedApp, appRoutes, method, pathName);
+        const proxyDecision = getProxyDecision(loadedApp, appRoutes, method, pathName, req.headers, proxyHosts);
 
         if (debugEnabled) {
           const matchedRoutesForDebug =
@@ -860,19 +981,30 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
               `  method: ${method}\n` +
               `  path: ${pathName}\n` +
               `  rawPath: ${rawPathName}\n` +
+              `  hostname: ${proxyDecision.requestHostname ?? "unavailable"}\n` +
               `  matchedRoutes: ${matchedDebugText}\n` +
-              `  proxy: ${shouldProxy}`,
+              `  proxy: ${proxyDecision.shouldProxy}\n` +
+              `  proxyReason: ${proxyDecision.reason ?? "none"}`,
           );
         }
 
-        if (!shouldProxy) {
+        if (!proxyDecision.shouldProxy) {
           next();
           return;
         }
 
-        proxyToBackend(res, backendTarget, requestPath, req.method, req.headers, req, (error) => {
-          server.config.logger.error(`[hono-dev-proxy] proxy error: ${error.message}`);
-        });
+        proxyToBackend(
+          res,
+          backendTarget,
+          requestPath,
+          req.method,
+          req.headers,
+          req,
+          proxyDecision.normalizedHost,
+          (error) => {
+            server.config.logger.error(`[hono-dev-proxy] proxy error: ${error.message}`);
+          },
+        );
       });
 
       // Vite 关闭时回收后端服务，避免端口泄漏
