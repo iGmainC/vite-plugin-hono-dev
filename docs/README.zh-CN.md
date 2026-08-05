@@ -184,6 +184,7 @@ git push origin v0.3.0
 5. 正式发布 GitHub Release，并附加 npm tarball。
 
 首次发布前需要配置仓库 Secret `NPM_TOKEN`。该流程支持安全重跑：已有 Draft Release 时会复用；npm 已存在相同版本时会跳过重复发布。
+如果推送 tag 后发生基础设施故障，可以通过 workflow 的手动 `tag` 输入重跑同一 tag；任务仍会 checkout 并发布该 tag 对应的提交。
 
 PR 和推送到 `main` 会运行 `.github/workflows/ci.yml`，使用相同的 `bun run verify` 反馈闭环。
 
