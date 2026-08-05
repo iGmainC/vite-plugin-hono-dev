@@ -18,16 +18,17 @@
 
 这个插件的设计灵感来自 Cloudflare Workers 的 React 模板，也就是基于 `@cloudflare/vite-plugin` 的那套开发体验。
 
-两者的共同点，是都试图把“服务端运行时”接入到 Vite 的开发链路里：前端继续享受 Vite 的 HMR 和中间件能力，服务端逻辑也能在同一套 dev server 流程里参与请求处理。不同点在于，`@cloudflare/vite-plugin` 面向的是 Cloudflare Workers / workerd 运行时，而本项目面向的是本地独立运行的 Hono Node 服务。
+两者的共同点，是都试图把“服务端运行时”接入到 Vite 的开发链路里：前端继续享受 Vite 的 HMR 和中间件能力，服务端逻辑也能在同一套 dev server 流程里参与请求处理。不同点在于，`@cloudflare/vite-plugin` 面向的是 Cloudflare Workers / workerd 运行时，而本项目面向的是与 Vite 同宿主运行的本地独立 Hono Node 或 Bun 服务。
 
 ## 特性
 
 - 动态路由命中代理（`router.match` + `app.routes` 交叉校验）。
+- 通过 `runtime: "auto" | "node" | "bun"` 选择后端 adapter；`auto` 跟随 Vite 宿主。
 - 后端入口及其 SSR 依赖图热重载（无需重启 Vite）。
 - 支持 `HEAD -> GET` 匹配回退。
 - 保留浏览器请求语义，例如原始 `Origin`，同时补充 `X-Forwarded-*` 代理头。
 - 支持 `/api/*` 一类带前缀的 Hono middleware 路由，但不会让全局 middleware-only 路由单独接管 Vite fallback。
-- 后端入口导出 `injectWebSocket(server)` 适配器钩子时，可代理命中的 WebSocket upgrade 请求。
+- 后端入口导出对应的 Node 或 Bun WebSocket adapter 时，通过运行时无关的桥接层代理命中的 WebSocket 请求。
 - Vite 内部模块和已存在的 Vite 静态/源码文件不会被 Hono catch-all 路由劫持。
 - 仅在 `vite dev` 生效（`apply: "serve"`）。
 
@@ -63,7 +64,12 @@ export default defineConfig({
 });
 ```
 
-后端入口必须导出 Hono app：`default` 导出或命名导出 `app`。如果需要 WebSocket 路由，也可以额外导出 `injectWebSocket(server)`，例如来自 `@hono/node-ws` 的注入函数，让插件把 WebSocket adapter 绑定到底层 Node server。
+后端入口必须导出 Hono app：`default` 导出或命名导出 `app`。
+
+WebSocket 需要按运行时导出对应 adapter：
+
+- Node：导出 `injectWebSocket(server)`，例如来自 `@hono/node-ws`。
+- Bun：直接从 `hono/bun` 导入并导出 `websocket`，路由使用同模块的 `upgradeWebSocket` helper。
 
 ## 配置项
 
@@ -72,12 +78,23 @@ type HonoDevProxyPluginOptions = {
   entry: string;
   port?: number; // 默认 8787
   host?: string; // 默认 "localhost"
+  runtime?: "auto" | "node" | "bun"; // 默认 "auto"
   debug?: boolean; // 默认 false
   stripTrailingSlash?: boolean; // 默认 false
 };
 ```
 
 默认情况下，请求路径会保留原始尾斜杠语义，让 Hono 按严格路径匹配。只有明确需要旧的尾斜杠归一化行为时，才设置 `stripTrailingSlash: true`。
+
+### 运行时选择
+
+后端入口通过 Vite 的 `ssrLoadModule()` 加载，与 Vite 运行在同一个 JavaScript 进程中。因此，运行时选项选择的是 server adapter，不会额外启动 Node 或 Bun 子进程。
+
+- `auto`：Vite 本身由 Bun 启动时使用 Bun，否则使用 Node。
+- `node`：使用 `@hono/node-server`。Vite 由 Bun 启动时，也可以通过 Bun 的 Node 兼容层显式选择它。
+- `bun`：使用 `Bun.serve()`，要求 Vite 本身由 Bun 启动，例如执行 `bun run vite`。如果 Vite 运行在 Node 中，插件会在启动阶段给出明确错误，不会静默退回 Node。
+
+当后端 SSR 依赖图包含 Bun-only 模块时，应选择 `runtime: "bun"`；当入口或 adapter 依赖 Node 语义时，应选择 `runtime: "node"`。由于 `auto` 跟随宿主，把启动命令从 `node vite` 改成 `bun run vite` 时，Node 专用 WebSocket 导出也可能需要切换为 Bun 对应实现。
 
 ## 工作原理
 
@@ -98,7 +115,7 @@ type HonoDevProxyPluginOptions = {
 本项目借鉴的是“让服务端逻辑接入 Vite dev server”的开发模型，但没有复刻 Cloudflare 的 Worker 运行时集成。
 
 1. Vite 启动时，插件通过 `ssrLoadModule` 加载 Hono 后端入口，因此后端代码可以直接用 Vite 的 SSR loader 处理 TS / ESM。
-2. 在 `configureServer` 阶段，插件使用 `@hono/node-server` 启动一个独立的本地 Hono 服务，并把实际请求处理委托给当前加载的 Hono app。
+2. 在 `configureServer` 阶段，插件根据解析出的运行时，使用 `@hono/node-server` 或 `Bun.serve()` 启动一个独立的本地 Hono 服务，并把实际请求处理委托给当前加载的 Hono app。
 3. 后端服务启动会参与 Vite 启动握手。如果配置的后端 host/port 不可用，Vite 启动会直接失败，避免静默代理到错误服务。
 4. 对每个进入 Vite 的请求，插件会先放行 Vite 内部模块和已存在的 Vite 静态/源码文件，再用 `app.router.match()` 和 `app.routes` 做交叉校验，只在真正命中 Hono 路由时才反向代理到后端。带明确前缀的 middleware 路由可以被代理，全局 middleware-only 路由不会作为唯一代理依据。
 5. 后端 SSR 依赖文件变更时，插件在 `hotUpdate` 中重新加载入口模块，更新内存中的 Hono app 和路由索引，从而做到“不重启 Vite 也能刷新后端逻辑”。
@@ -148,20 +165,27 @@ bun run dev
 - WebSocket adapter 注入在后端服务启动时绑定；如果修改的是 adapter 接线本身，需要重启 `vite dev`。
 - 正式发布请使用 `bun run build`（tsup）。`build:bun` 仅用于备用验证。
 
-## 发布流程
+## Release 发布流程
+
+发布由 Git tag 驱动。打 tag 前，先更新 `package.json`，确保版本与 tag 完全一致：
 
 ```bash
-bun install
-bun run typecheck
-bun run build
-bun run test:smoke
-npm login
-npm publish --access public
+bun run verify
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-GitHub Actions 模板：
-- CI：`.github/workflows/ci.yml`
-- 手动发布模板：`.github/workflows/release-manual-template.yml`（需配置 `NPM_TOKEN`）
+推送 `v*` tag 后，`.github/workflows/release.yml` 会自动执行：
+
+1. 校验 tag 必须等于 `v` 加 `package.json` 版本。
+2. 运行完整 Node/Bun 验证并构建发布产物。
+3. 生成 npm tarball，并创建带自动 changelog 的 Draft GitHub Release。
+4. 将同一个 tarball 带 provenance 发布到 npm。
+5. 正式发布 GitHub Release，并附加 npm tarball。
+
+首次发布前需要配置仓库 Secret `NPM_TOKEN`。该流程支持安全重跑：已有 Draft Release 时会复用；npm 已存在相同版本时会跳过重复发布。
+
+PR 和推送到 `main` 会运行 `.github/workflows/ci.yml`，使用相同的 `bun run verify` 反馈闭环。
 
 ## 后续接入指引
 

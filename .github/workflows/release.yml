@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.js for npm publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify release tag
+        id: metadata
+        run: node ./scripts/verify-release-tag.mjs
+
+      - name: Verify and build release
+        run: bun run verify
+
+      - name: Pack npm artifact
+        run: |
+          mkdir -p artifacts
+          npm pack --pack-destination artifacts --ignore-scripts
+
+      - name: Create or update draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft' > /tmp/release-draft-state 2>/dev/null; then
+            if ! grep -qx 'true' /tmp/release-draft-state; then
+              echo "GitHub Release $GITHUB_REF_NAME is already published."
+              exit 0
+            fi
+          else
+            release_flags=(--draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${release_flags[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" artifacts/*.tgz --clobber
+
+      - name: Publish package to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_SPEC: ${{ steps.metadata.outputs.package_spec }}
+        run: |
+          if npm view "$PACKAGE_SPEC" version --silent > /dev/null 2>&1; then
+            echo "$PACKAGE_SPEC is already published; skipping npm publish."
+          else
+            npm publish artifacts/*.tgz --access public --provenance --ignore-scripts
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

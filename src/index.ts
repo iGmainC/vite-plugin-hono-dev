@@ -4,7 +4,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import * as path from "node:path";
 import type { Socket } from "node:net";
-import { createAdaptorServer, type ServerType } from "@hono/node-server";
+import type { ServerType } from "@hono/node-server";
 import { METHOD_NAME_ALL, type Result } from "hono/router";
 import type { RouterRoute } from "hono/types";
 import { isMiddleware } from "hono/utils/handler";
@@ -18,6 +18,7 @@ import {
   type ResolvedConfig,
   type ViteDevServer,
 } from "vite";
+import WebSocket, { WebSocketServer, type RawData } from "ws";
 
 /**
  * 插件入参：
@@ -28,9 +29,16 @@ export interface HonoDevProxyPluginOptions {
   entry: string;
   port?: number;
   host?: string;
+  runtime?: HonoDevRuntime;
   debug?: boolean;
   stripTrailingSlash?: boolean;
 }
+
+/** 后端服务使用的运行时；auto 跟随启动 Vite 的宿主运行时 */
+export type HonoDevRuntime = "auto" | "node" | "bun";
+
+/** 插件实际解析出的后端运行时 */
+type ResolvedHonoDevRuntime = Exclude<HonoDevRuntime, "auto">;
 
 /**
  * Hono 路由匹配结果类型：
@@ -56,8 +64,49 @@ type HonoLikeApp = {
 /** 后端入口可选导出的 WebSocket 注入器，用于把 adapter 绑定到实际 Node server */
 type BackendWebSocketInjector = (server: ServerType) => void;
 
+/** Bun.serve 所需的 WebSocket handlers，由后端入口从 hono/bun 导出 */
+type BackendBunWebSocketHandler = Record<PropertyKey, unknown>;
+
+/** 插件使用的最小 Bun Server 能力，避免要求 Node 用户安装 Bun 类型包 */
+type BunBackendServer = {
+  hostname: string;
+  port: number;
+  url: URL;
+  stop: (closeActiveConnections?: boolean) => void;
+};
+
+/** 插件使用的最小 Bun 全局能力 */
+type BunRuntimeApi = {
+  serve: (options: {
+    hostname: string;
+    port: number;
+    fetch: (request: Request, ...args: unknown[]) => Promise<Response> | Response;
+    websocket?: BackendBunWebSocketHandler;
+  }) => BunBackendServer;
+};
+
 const DEFAULT_HOST = "localhost";
 const DEFAULT_PORT = 8787;
+const DEFAULT_RUNTIME: HonoDevRuntime = "auto";
+// 后端连接建立前最多缓存的 WebSocket 消息数，防止异常客户端无限占用内存。
+const MAX_PENDING_WEBSOCKET_MESSAGES = 100;
+// ws 客户端会自行生成这些握手头，不能从浏览器请求中重复透传。
+const GENERATED_WEBSOCKET_HEADERS = new Set([
+  "host",
+  "connection",
+  "upgrade",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-extensions",
+  "sec-websocket-protocol",
+]);
+
+/** 判断 close code 是否允许出现在 WebSocket close frame 中 */
+const isForwardableWebSocketCloseCode = (code: number): boolean => {
+  if (code >= 3000 && code <= 4999) return true;
+  if (code < 1000 || code > 1014) return false;
+  return code !== 1004 && code !== 1005 && code !== 1006;
+};
 // Vite dev server 内部模块路径前缀，必须优先交给 Vite 自己处理。
 const VITE_INTERNAL_PATH_PREFIXES = ["/@vite/", "/@id/", "/@fs/", "/@react-refresh"];
 // Vite dev server 内部固定探活路径，不能被后端 catch-all 路由接管。
@@ -66,6 +115,29 @@ type MiddlewareNext = (error?: unknown) => void;
 
 /** 判断值是否为非 null 对象 */
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+
+/** 读取当前宿主进程暴露的 Bun API；Node 下返回 undefined */
+const getBunRuntimeApi = (): BunRuntimeApi | undefined =>
+  (globalThis as typeof globalThis & { Bun?: BunRuntimeApi }).Bun;
+
+/**
+ * 解析后端运行时：
+ * - auto 跟随当前 Vite 宿主，避免入口在不同 JavaScript 运行时之间执行
+ * - 显式 bun 时要求 Vite 本身由 Bun 启动
+ */
+const resolveBackendRuntime = (runtime: HonoDevRuntime): ResolvedHonoDevRuntime => {
+  const bunRuntime = getBunRuntimeApi();
+  if (runtime === "auto") return bunRuntime ? "bun" : "node";
+  if (runtime !== "node" && runtime !== "bun") {
+    throw new Error(`[hono-dev-proxy] invalid runtime "${String(runtime)}"; expected "auto", "node", or "bun".`);
+  }
+  if (runtime === "bun" && !bunRuntime) {
+    throw new Error(
+      '[hono-dev-proxy] runtime "bun" requires Vite to run under Bun. Start Vite with `bun run vite` or use runtime "node".',
+    );
+  }
+  return runtime;
+};
 
 /**
  * 运行时校验是否为“可用的 Hono app”。
@@ -106,6 +178,13 @@ const extractBackendWebSocketInjector = (moduleExports: unknown): BackendWebSock
   if (!isObject(moduleExports)) return undefined;
   const maybeInjector = moduleExports.injectWebSocket;
   return typeof maybeInjector === "function" ? (maybeInjector as BackendWebSocketInjector) : undefined;
+};
+
+/** 从入口模块提取 hono/bun 的 WebSocket handlers */
+const extractBackendBunWebSocketHandler = (moduleExports: unknown): BackendBunWebSocketHandler | undefined => {
+  if (!isObject(moduleExports)) return undefined;
+  const maybeWebSocket = moduleExports.websocket;
+  return isObject(maybeWebSocket) ? maybeWebSocket : undefined;
 };
 
 /**
@@ -357,9 +436,10 @@ const proxyToBackend = (
 /**
  * 反向代理 WebSocket upgrade 请求：
  * - 只处理已命中 Hono 路由的 upgrade，避免吞掉 Vite 自己的 HMR WebSocket
- * - 透传握手头和后续双向 socket 流
+ * - 同步接管前端握手，再以独立后端连接双向转发消息和关闭语义
  */
 const proxyWebSocketToBackend = (
+  bridgeServer: WebSocketServer,
   requestStream: IncomingMessage,
   clientSocket: Socket,
   head: Buffer,
@@ -369,55 +449,86 @@ const proxyWebSocketToBackend = (
   onError: (error: Error) => void,
 ): void => {
   const targetUrl = new URL(requestPath, targetOrigin);
-  const isSecure = targetUrl.protocol === "https:";
-  const requestOptions: RequestOptions = {
-    protocol: targetUrl.protocol,
-    hostname: targetUrl.hostname,
-    port: targetUrl.port,
-    method: "GET",
-    path: `${targetUrl.pathname}${targetUrl.search}`,
-    headers: buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream),
-  };
+  targetUrl.protocol = targetUrl.protocol === "https:" ? "wss:" : "ws:";
+  const proxyHeaders = buildProxyRequestHeaders(targetUrl, requestHeaders, requestStream);
+  const backendHeaders = Object.fromEntries(
+    Object.entries(proxyHeaders).filter(([headerName, headerValue]) => {
+      return headerValue !== undefined && !GENERATED_WEBSOCKET_HEADERS.has(headerName.toLowerCase());
+    }),
+  );
+  const requestedProtocols = (getFirstHeaderValue(requestHeaders["sec-websocket-protocol"]) ?? "")
+    .split(",")
+    .map((protocol) => protocol.trim())
+    .filter(Boolean);
+  // 前端 ws server 默认选择首个协议，后端也只协商同一个值，避免两侧协议不一致。
+  const selectedProtocol = requestedProtocols[0];
 
-  const proxyRequest = (isSecure ? https : http).request(requestOptions);
+  bridgeServer.handleUpgrade(requestStream, clientSocket, head, (frontendSocket) => {
+    const pendingMessages: Array<{ data: RawData; isBinary: boolean }> = [];
+    const backendSocket = new WebSocket(targetUrl, selectedProtocol, { headers: backendHeaders });
+    let backendErrorReported = false;
 
-  proxyRequest.on("upgrade", (proxyResponse, backendSocket, backendHead) => {
-    const responseHead = [
-      `HTTP/1.1 ${proxyResponse.statusCode ?? 101} ${proxyResponse.statusMessage || "Switching Protocols"}`,
-      ...proxyResponse.rawHeaders.reduce<string[]>((headers, header, index, rawHeaders) => {
-        // rawHeaders 是 [key, value, key, value]，这里按键值对还原握手响应头。
-        if (index % 2 === 0) headers.push(`${header}: ${rawHeaders[index + 1] ?? ""}`);
-        return headers;
-      }, []),
-      "",
-      "",
-    ].join("\r\n");
+    /** 上报一次后端连接错误，并以服务端错误语义关闭前端连接 */
+    const handleBackendError = (error: Error): void => {
+      if (!backendErrorReported) {
+        backendErrorReported = true;
+        onError(error);
+      }
+      if (frontendSocket.readyState === WebSocket.OPEN) {
+        frontendSocket.close(1011, "Hono backend WebSocket failed");
+      } else if (frontendSocket.readyState === WebSocket.CONNECTING) {
+        frontendSocket.terminate();
+      }
+    };
 
-    clientSocket.write(responseHead);
-    if (backendHead.length > 0) {
-      clientSocket.write(backendHead);
-    }
-    if (head.length > 0) {
-      backendSocket.write(head);
-    }
+    frontendSocket.on("message", (data, isBinary) => {
+      if (backendSocket.readyState === WebSocket.OPEN) {
+        backendSocket.send(data, { binary: isBinary });
+        return;
+      }
+      if (backendSocket.readyState !== WebSocket.CONNECTING) return;
+      if (pendingMessages.length >= MAX_PENDING_WEBSOCKET_MESSAGES) {
+        handleBackendError(new Error("WebSocket backend connection did not become ready before the message queue filled."));
+        backendSocket.terminate();
+        return;
+      }
+      pendingMessages.push({ data, isBinary });
+    });
 
-    // 握手成功后进入透明 TCP 转发。
-    backendSocket.pipe(clientSocket);
-    clientSocket.pipe(backendSocket);
+    backendSocket.on("open", () => {
+      for (const { data, isBinary } of pendingMessages.splice(0)) {
+        backendSocket.send(data, { binary: isBinary });
+      }
+    });
+    backendSocket.on("message", (data, isBinary) => {
+      if (frontendSocket.readyState === WebSocket.OPEN) {
+        frontendSocket.send(data, { binary: isBinary });
+      }
+    });
+
+    frontendSocket.on("close", (code, reason) => {
+      if (backendSocket.readyState === WebSocket.CONNECTING) {
+        backendSocket.terminate();
+      } else if (backendSocket.readyState === WebSocket.OPEN) {
+        if (isForwardableWebSocketCloseCode(code)) {
+          backendSocket.close(code, reason.toString());
+        } else {
+          backendSocket.terminate();
+        }
+      }
+    });
+    backendSocket.on("close", (code, reason) => {
+      if (frontendSocket.readyState === WebSocket.OPEN) {
+        if (isForwardableWebSocketCloseCode(code)) {
+          frontendSocket.close(code, reason.toString());
+        } else {
+          frontendSocket.terminate();
+        }
+      }
+    });
+    frontendSocket.on("error", () => backendSocket.terminate());
+    backendSocket.on("error", handleBackendError);
   });
-
-  proxyRequest.on("error", (error) => {
-    onError(error);
-    if (!clientSocket.destroyed) {
-      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    }
-  });
-
-  clientSocket.on("error", () => {
-    proxyRequest.destroy();
-  });
-
-  proxyRequest.end();
 };
 
 export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): Plugin {
@@ -425,14 +536,19 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
   const backendPort = options.port ?? DEFAULT_PORT;
   const debugEnabled = options.debug ?? false;
   const stripTrailingSlashEnabled = options.stripTrailingSlash ?? false;
+  const configuredRuntime = options.runtime ?? DEFAULT_RUNTIME;
+  // 同步接管 Vite upgrade socket，再与后端建立独立 WebSocket 连接。
+  const websocketBridgeServer = new WebSocketServer({ noServer: true });
 
   // 在 configResolved 后会转换为绝对路径
   let entryPath = options.entry;
   let normalizedEntryPath = options.entry;
   let backendTarget = `http://${backendHost}:${backendPort}`;
-  let backendServer: ServerType | undefined;
+  let resolvedRuntime: ResolvedHonoDevRuntime | undefined;
+  let stopBackendServer: (() => void) | undefined;
   let loadedApp: HonoLikeApp | undefined;
   let backendWebSocketInjector: BackendWebSocketInjector | undefined;
+  let backendBunWebSocketHandler: BackendBunWebSocketHandler | undefined;
   // 存储 app.routes 的 method+path 索引，快速做命中校验
   let appRoutes = new Set<string>();
   // 存储 SSR 模块图中从后端入口可达的真实文件，避免用目录前缀误判前端文件
@@ -506,6 +622,7 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
       const nextApp = extractHonoApp(moduleExports, options.entry);
       loadedApp = nextApp;
       backendWebSocketInjector = extractBackendWebSocketInjector(moduleExports);
+      backendBunWebSocketHandler = extractBackendBunWebSocketHandler(moduleExports);
       const proxyableRoutes = nextApp.routes.filter(isProxyableRoute);
       appRoutes = new Set(proxyableRoutes.map(getRouteKey));
       backendModuleFiles = collectBackendModuleFiles(getBackendEntryModule(server));
@@ -559,34 +676,40 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
   const toChangedPath = (server: ViteDevServer, filePath: string): string =>
     path.relative(server.config.root, filePath) || filePath;
 
-  /** 启动后端 Hono 服务，并在监听成功前阻塞 Vite 启动 */
-  const startBackendServer = async (server: ViteDevServer): Promise<void> => {
+  /** 创建读取最新 app 的委托 fetch，使 Node/Bun adapter 共享热更新语义 */
+  const fetchLoadedApp = (request: Request, ...args: unknown[]): Promise<Response> | Response => {
+    if (!loadedApp) {
+      return new Response("Hono backend is not ready.", { status: 503 });
+    }
+    return loadedApp.fetch(request, ...args);
+  };
+
+  /** 使用 Node adapter 启动后端，并在监听成功前阻塞 Vite 启动 */
+  const startNodeBackendServer = async (server: ViteDevServer): Promise<void> => {
+    // 延迟加载 Node adapter，Bun 路径不会初始化另一套后端 server adapter。
+    const { createAdaptorServer } = await import("@hono/node-server");
     // 启动独立 Hono Node 服务，供命中路由时代理转发
-    backendServer = createAdaptorServer({
-      // 使用委托函数读取最新 loadedApp，从而支持后端热重载
-      fetch: (request, ...args) => {
-        if (!loadedApp) {
-          return new Response("Hono backend is not ready.", { status: 503 });
-        }
-        return loadedApp.fetch(request, ...args);
-      },
+    const backendServer = createAdaptorServer({
+      fetch: fetchLoadedApp,
       hostname: backendHost,
       port: backendPort,
     });
     backendWebSocketInjector?.(backendServer);
+    stopBackendServer = () => backendServer.close();
 
-    server.config.logger.info(`[hono-dev-proxy] starting backend on http://${backendHost}:${backendPort}`);
+    server.config.logger.info(`[hono-dev-proxy] starting node backend on http://${backendHost}:${backendPort}`);
 
     await new Promise<void>((resolve, reject) => {
       const cleanupStartupListeners = (): void => {
-        backendServer?.off("listening", handleListening);
-        backendServer?.off("error", handleStartupError);
+        backendServer.off("listening", handleListening);
+        backendServer.off("error", handleStartupError);
       };
 
       const handleListening = (): void => {
         cleanupStartupListeners();
-        const address = backendServer?.address();
+        const address = backendServer.address();
         if (address && typeof address === "object") {
+          backendTarget = `http://${backendHost}:${address.port}`;
           server.config.logger.info(`[hono-dev-proxy] backend ready on http://${address.address}:${address.port}`);
           return resolve();
         }
@@ -596,20 +719,59 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
 
       const handleStartupError = (error: Error): void => {
         cleanupStartupListeners();
-        backendServer?.close();
-        backendServer = undefined;
+        backendServer.close();
+        stopBackendServer = undefined;
         reject(new Error(`[hono-dev-proxy] failed to start backend on ${backendHost}:${backendPort}: ${error.message}`));
       };
 
-      backendServer?.once("listening", handleListening);
-      backendServer?.once("error", handleStartupError);
-      backendServer?.listen(backendPort, backendHost);
+      backendServer.once("listening", handleListening);
+      backendServer.once("error", handleStartupError);
+      backendServer.listen(backendPort, backendHost);
     });
 
     backendServer.on("error", (error) => {
       const normalizedError = error instanceof Error ? error : new Error(String(error));
       server.config.logger.error(`[hono-dev-proxy] backend error: ${normalizedError.message}`);
     });
+  };
+
+  /** 使用当前宿主的 Bun.serve 启动后端 */
+  const startBunBackendServer = (server: ViteDevServer): void => {
+    const bunRuntime = getBunRuntimeApi();
+    if (!bunRuntime) {
+      // resolveBackendRuntime 已提供面向用户的错误；这里防止运行时状态在启动期间异常变化。
+      throw new Error('[hono-dev-proxy] runtime "bun" is unavailable in the current Vite process.');
+    }
+
+    server.config.logger.info(`[hono-dev-proxy] starting bun backend on http://${backendHost}:${backendPort}`);
+    try {
+      const backendServer = bunRuntime.serve({
+        hostname: backendHost,
+        port: backendPort,
+        fetch: fetchLoadedApp,
+        ...(backendBunWebSocketHandler ? { websocket: backendBunWebSocketHandler } : {}),
+      });
+      backendTarget = `http://${backendHost}:${backendServer.port}`;
+      // true 会同时关闭活跃连接，确保 Vite 退出后不残留开发端口。
+      stopBackendServer = () => backendServer.stop(true);
+      server.config.logger.info(`[hono-dev-proxy] backend ready on ${backendServer.url.toString()}`);
+    } catch (error) {
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      throw new Error(`[hono-dev-proxy] failed to start backend on ${backendHost}:${backendPort}: ${normalizedError.message}`);
+    }
+  };
+
+  /** 按已解析的单一运行时启动后端服务 */
+  const startBackendServer = async (server: ViteDevServer): Promise<void> => {
+    if (!resolvedRuntime) {
+      throw new Error("[hono-dev-proxy] backend runtime must be resolved before server startup.");
+    }
+    server.config.logger.info(`[hono-dev-proxy] using ${resolvedRuntime} runtime (configured: ${configuredRuntime})`);
+    if (resolvedRuntime === "bun") {
+      startBunBackendServer(server);
+      return;
+    }
+    await startNodeBackendServer(server);
   };
 
   return {
@@ -636,6 +798,9 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
       return getClientHotUpdateModules(options.modules);
     },
     async configureServer(server: ViteDevServer) {
+      // 必须先验证运行时，再加载可能包含 Bun-only / Node-only 模块的后端依赖图。
+      resolvedRuntime = resolveBackendRuntime(configuredRuntime);
+
       // 通过 Vite 的 SSR 模块加载能力导入后端入口（支持 TS/ESM）
       await loadBackendApp(server, "initial", true);
 
@@ -650,7 +815,7 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
         if (!shouldProxyRequest(loadedApp, appRoutes, "GET", pathName)) return;
 
         const requestPath = getProxyRequestPath(req, stripTrailingSlashEnabled);
-        proxyWebSocketToBackend(req, socket, head, backendTarget, requestPath, req.headers, (error) => {
+        proxyWebSocketToBackend(websocketBridgeServer, req, socket, head, backendTarget, requestPath, req.headers, (error) => {
           server.config.logger.error(`[hono-dev-proxy] websocket proxy error: ${error.message}`);
         });
       };
@@ -713,10 +878,12 @@ export default function honoDevProxyPlugin(options: HonoDevProxyPluginOptions): 
       // Vite 关闭时回收后端服务，避免端口泄漏
       const closeBackendServer = () => {
         server.httpServer?.off("upgrade", handleWebSocketUpgrade);
-        if (backendServer) {
-          backendServer.close();
-          backendServer = undefined;
+        for (const websocketClient of websocketBridgeServer.clients) {
+          websocketClient.terminate();
         }
+        websocketBridgeServer.close();
+        stopBackendServer?.();
+        stopBackendServer = undefined;
       };
 
       server.httpServer?.once("close", closeBackendServer);
