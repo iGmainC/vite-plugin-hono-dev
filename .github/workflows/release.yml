@@ -78,13 +78,12 @@ jobs:
 
       - name: Publish package to npm
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PACKAGE_SPEC: ${{ steps.metadata.outputs.package_spec }}
         run: |
           if npm view "$PACKAGE_SPEC" version --silent > /dev/null 2>&1; then
             echo "$PACKAGE_SPEC is already published; skipping npm publish."
           else
-            npm publish ./artifacts/*.tgz --access public --provenance --ignore-scripts
+            npm publish ./artifacts/*.tgz --access public --ignore-scripts
           fi
 
       - name: Publish GitHub Release

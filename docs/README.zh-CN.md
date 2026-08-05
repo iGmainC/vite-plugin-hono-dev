@@ -183,7 +183,7 @@ git push origin v0.3.0
 4. 将同一个 tarball 带 provenance 发布到 npm。
 5. 正式发布 GitHub Release，并附加 npm tarball。
 
-首次发布前需要配置仓库 Secret `NPM_TOKEN`。该流程支持安全重跑：已有 Draft Release 时会复用；npm 已存在相同版本时会跳过重复发布。
+首次发布前，需要在 npm Trusted Publishing 中配置 GitHub Actions：owner 填 `iGmainC`、repository 填 `vite-plugin-hono-dev`、workflow 填 `release.yml`，并允许 `npm publish`。workflow 使用短期 OIDC 凭据，不再需要 `NPM_TOKEN` Secret。该流程支持安全重跑：已有 Draft Release 时会复用；npm 已存在相同版本时会跳过重复发布。
 如果推送 tag 后发生基础设施故障，可以通过 workflow 的手动 `tag` 输入重跑同一 tag；任务仍会 checkout 并发布该 tag 对应的提交。
 
 PR 和推送到 `main` 会运行 `.github/workflows/ci.yml`，使用相同的 `bun run verify` 反馈闭环。

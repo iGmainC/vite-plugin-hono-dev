@@ -183,7 +183,7 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml`. The workflow:
 4. Publishes that exact tarball to npm with provenance.
 5. Publishes the GitHub Release and attaches the npm tarball.
 
-Configure the `NPM_TOKEN` repository secret before the first release. The workflow is retry-safe: it reuses an existing draft Release and skips npm publishing when that package version already exists.
+Before the first release, configure npm Trusted Publishing for GitHub Actions with owner `iGmainC`, repository `vite-plugin-hono-dev`, workflow `release.yml`, and the `npm publish` permission. The workflow uses short-lived OIDC credentials and does not require an `NPM_TOKEN` secret. It is retry-safe: it reuses an existing draft Release and skips npm publishing when that package version already exists.
 If infrastructure fails after a tag push, rerun the same tag from the workflow's manual `tag` input; the job still checks out and publishes the tagged commit.
 
 Pull requests and pushes to `main` run `.github/workflows/ci.yml` with the same `bun run verify` feedback loop.
