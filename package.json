@@ -62,7 +62,7 @@
     "@types/ws": "^8.18.1",
     "hono": "^4.12.2",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.0",
     "vite": "^8.0.14"
   },
   "dependencies": {
